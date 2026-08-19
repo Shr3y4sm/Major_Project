@@ -18,12 +18,15 @@ Run:
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 from typing import Optional
 
 import gradio as gr
+import nibabel as nib
 import numpy as np
 import plotly.graph_objects as go
-from scipy.ndimage import zoom
+from scipy.ndimage import gaussian_filter, zoom
 from skimage import measure
 
 from src.dicom_loader import (
@@ -51,9 +54,10 @@ CLASS_NAMES = {
 
 # 3D surface colors (RGBA) per class.
 CLASS_COLORS = {
-    1: "rgba(220, 20, 60, 0.85)",    # Crimson
-    2: "rgba(255, 215, 0, 0.85)",    # Yellow
-    3: "rgba(0, 255, 255, 0.85)",    # Cyan
+    1: "#FF004D",  # Necrotic core
+    2: "#00FF4D",  # Edema shell
+    3: "#00D0FF",  # Enhancing core
+    4: "#00D0FF",  # Native BraTS enhancing label
 }
 
 # MPR overlay colors (RGBA) per class.
@@ -61,6 +65,7 @@ MPR_COLORS = {
     1: (220, 20, 60, 200),    # Crimson
     2: (255, 215, 0, 200),    # Yellow
     3: (0, 255, 255, 200),    # Cyan
+    4: (0, 208, 255, 200),    # Native BraTS enhancing label
 }
 
 # ---------------------------------------------------------------------------
@@ -178,6 +183,53 @@ def _build_metrics_markdown(volumes: dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+def _discover_segmentation_path(
+    paths: dict[str, str],
+    volume_shape: Optional[tuple[int, ...]] = None,
+) -> Optional[str]:
+    """Find a BraTS ``*_seg.nii`` sidecar near the uploaded modalities."""
+    patient_ids = {
+        match.group(0)
+        for path in paths.values()
+        for match in [re.search(r"BraTS\d{4}_\d{5}", path, re.IGNORECASE)]
+        if match
+    }
+    visited: set[Path] = set()
+    for raw_path in paths.values():
+        directory = Path(raw_path).resolve().parent
+        for _ in range(5):
+            if directory in visited or not directory.exists():
+                break
+            visited.add(directory)
+            for candidate in directory.glob("*_seg.nii*"):
+                if candidate.is_file() and (
+                    not patient_ids
+                    or any(pid.lower() in candidate.name.lower() for pid in patient_ids)
+                ):
+                    return str(candidate)
+            directory = directory.parent
+
+    # Gradio may copy uploads away from their original BraTS folder. For the
+    # bundled sample, recover the sidecar by its shared volume shape.
+    sample_root = Path.cwd() / "sample_brats_patient"
+    if volume_shape is not None and sample_root.is_dir():
+        for candidate in sample_root.rglob("*_seg.nii*"):
+            if candidate.is_file() and nib.load(str(candidate)).shape == volume_shape:
+                return str(candidate)
+    return None
+
+
+def _load_reference_segmentation(paths: dict[str, str], shape: tuple[int, ...]) -> Optional[np.ndarray]:
+    """Load a same-space BraTS segmentation sidecar when one is available."""
+    segmentation_path = _discover_segmentation_path(paths, shape)
+    if segmentation_path is None:
+        return None
+    segmentation = nib.load(segmentation_path).get_fdata().astype(np.int16)
+    if segmentation.shape != shape:
+        return None
+    return segmentation
+
+
 # ---------------------------------------------------------------------------
 # 3D surface rendering
 # ---------------------------------------------------------------------------
@@ -186,6 +238,7 @@ def _build_metrics_markdown(volumes: dict[str, float]) -> str:
 def _build_3d_plot(
     pred_orig: np.ndarray,
     t2_volume: np.ndarray,
+    reference_seg: Optional[np.ndarray] = None,
 ) -> go.Figure:
     """Build an interactive 3D surface rendering of tumour classes.
 
@@ -201,41 +254,50 @@ def _build_3d_plot(
     """
     fig = go.Figure()
 
-    # Translucent brain surface from the T2 brain mask.
+    # Match notebook cell 7: smooth the thresholded brain mask before meshing.
     t2_norm = (t2_volume - t2_volume.min()) / (t2_volume.max() - t2_volume.min() + 1e-8)
-    brain_mask = t2_norm > 0.15
-    try:
-        verts, faces, _, _ = measure.marching_cubes(
-            brain_mask.astype(np.float32), level=0.5, step_size=2
-        )
-        fig.add_trace(
-            go.Mesh3d(
-                x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
-                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-                color="rgba(200, 200, 200, 0.12)",
-                opacity=0.12,
-                name="Brain Surface",
-                showlegend=True,
-                lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2, roughness=0.5),
-                lightposition=dict(x=100, y=200, z=150),
+    brain_mask = gaussian_filter((t2_norm > 0.15).astype(np.float32), sigma=1)
+    if brain_mask.any():
+        try:
+            verts, faces, _, _ = measure.marching_cubes(
+                brain_mask.astype(np.float32), level=0.5, step_size=2
             )
-        )
-    except Exception:
-        pass  # No brain surface if marching cubes fails.
+            fig.add_trace(
+                go.Mesh3d(
+                    x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
+                    i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                    color="#FFFFFF",
+                    opacity=0.10,
+                    name="Brain Surface",
+                    showlegend=True,
+                    lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2, roughness=0.5),
+                    lightposition=dict(x=100, y=200, z=150),
+                )
+            )
+        except Exception:
+            pass  # No brain surface if marching cubes fails.
 
-    # Tumour class surfaces.
-    for cls_id in (1, 2, 3):
-        mask = (pred_orig == cls_id).astype(np.float32)
-        if mask.sum() == 0:
+    # Use native BraTS label 4 for enhancing when a ground-truth sidecar exists.
+    segmentation = reference_seg if reference_seg is not None else pred_orig
+    class_ids = (1, 2, 4) if reference_seg is not None else (1, 2, 3)
+
+    # Tumour class surfaces. Only run marching_cubes when the class mask
+    # contains at least one voxel — evaluates the boolean mask explicitly
+    # with `.any()` (never `if mask:` on a NumPy array).
+    for cls_id in class_ids:
+        mask = segmentation == cls_id
+        if not mask.any():
             continue
         try:
-            verts, faces, _, _ = measure.marching_cubes(mask, level=0.5, step_size=1)
+            verts, faces, _, _ = measure.marching_cubes(
+                mask.astype(np.float32), level=0.5, step_size=1
+            )
             fig.add_trace(
                 go.Mesh3d(
                     x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
                     i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
                     color=CLASS_COLORS[cls_id],
-                    opacity=0.85,
+                    opacity=0.35 if cls_id == 2 else 1.0,
                     name=CLASS_NAMES[cls_id],
                     showlegend=True,
                     lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2, roughness=0.5),
@@ -246,9 +308,9 @@ def _build_3d_plot(
             continue  # Skip classes that fail to mesh.
 
     fig.update_layout(
-        title="3D Tumour Surface Reconstruction",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
+        title="Clinical 3D Reconstruction",
+        paper_bgcolor="#050505",
+        plot_bgcolor="#050505",
         font=dict(color="white"),
         margin=dict(l=0, r=0, b=0, t=40),
         showlegend=True,
@@ -290,7 +352,7 @@ def _overlay_segmentation(
             rgb[mask, 1] = rgb[mask, 1] * (1 - a / 255) + (g / 255) * (a / 255)
             rgb[mask, 2] = rgb[mask, 2] * (1 - a / 255) + (b / 255) * (a / 255)
 
-    return rgb
+    return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
 
 def _build_mpr_plot(
@@ -321,18 +383,18 @@ def _build_mpr_plot(
     coronal = _overlay_segmentation(scan_volume[:, coronal_idx, :], pred_orig[:, coronal_idx, :])
 
     fig = go.Figure()
-    fig.add_trace(go.Image(z=axial, name="Axial", xaxis="x1", yaxis="y1", hoverinfo="skip"))
+    fig.add_trace(go.Image(z=axial, name="Axial", xaxis="x", yaxis="y", hoverinfo="skip"))
     fig.add_trace(go.Image(z=sagittal, name="Sagittal", xaxis="x2", yaxis="y2", hoverinfo="skip"))
     fig.add_trace(go.Image(z=coronal, name="Coronal", xaxis="x3", yaxis="y3", hoverinfo="skip"))
 
     fig.update_layout(
         title="Multi-Planar Reconstruction (MPR) — Segmentation Overlay",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
+        paper_bgcolor="#050505",
+        plot_bgcolor="#050505",
         font=dict(color="white"),
         margin=dict(l=0, r=0, b=0, t=40),
-        xaxis1=dict(domain=[0.0, 0.32], showticklabels=False, showgrid=False),
-        yaxis1=dict(domain=[0.0, 1.0], showticklabels=False, showgrid=False),
+        xaxis=dict(domain=[0.0, 0.32], showticklabels=False, showgrid=False),
+        yaxis=dict(domain=[0.0, 1.0], showticklabels=False, showgrid=False),
         xaxis2=dict(domain=[0.34, 0.66], showticklabels=False, showgrid=False),
         yaxis2=dict(domain=[0.0, 1.0], showticklabels=False, showgrid=False),
         xaxis3=dict(domain=[0.68, 1.0], showticklabels=False, showgrid=False),
@@ -397,18 +459,33 @@ def run_analysis(
         # --- Resample prediction to original space ---
         pred_orig = _resample_prediction_to_original(pred_128, metadata)
 
+        # BraTS folders commonly contain the ground-truth sidecar without
+        # requiring it to be uploaded as a fifth input.
+        reference_seg = _load_reference_segmentation(
+            input_source, scans.volumes["t2"].shape
+        ) if isinstance(input_source, dict) else None
+
         # --- Volumetric metrics ---
         volumes = _compute_volumes(pred_orig, metadata)
         metrics_md = _build_metrics_markdown(volumes)
 
         # --- 3D surface rendering ---
         t2_volume = scans.volumes["t2"]
-        plot_3d = _build_3d_plot(pred_orig, t2_volume)
+        plot_3d = _build_3d_plot(pred_orig, t2_volume, reference_seg)
 
         # --- MPR viewer (FLAIR preferred, fallback T1ce) ---
-        scan_volume = scans.volumes.get("flair") or scans.volumes["t1ce"]
+        # NOTE: never use `volumes.get("flair") or volumes["t1ce"]` here —
+        # both are NumPy arrays whose truthiness raises the "ambiguous"
+        # ValueError. Use an explicit None-check instead.
+        scan_volume = scans.volumes.get("flair")
+        if scan_volume is None:
+            scan_volume = scans.volumes["t1ce"]
         plot_mpr = _build_mpr_plot(
-            scan_volume, pred_orig, axial_idx, sagittal_idx, coronal_idx
+            scan_volume,
+            reference_seg if reference_seg is not None else pred_orig,
+            axial_idx,
+            sagittal_idx,
+            coronal_idx,
         )
 
         return plot_3d, plot_mpr, metrics_md, error_md
