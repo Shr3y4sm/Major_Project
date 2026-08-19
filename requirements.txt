@@ -1,0 +1,21 @@
+# Core scientific stack
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Medical imaging
+nibabel>=5.1.0
+pydicom>=2.3.0
+dicom2nifti>=2.4.0
+scikit-image>=0.21.0
+
+# Deep learning
+torch>=2.0.0
+
+# ONNX export + inference
+onnx>=1.14.0
+onnxruntime>=1.16.0
+onnxruntime-gpu>=1.16.0 ; platform_system == "Linux"
+
+# Visualization / app
+plotly>=5.14.0
+gradio>=4.0.0
