@@ -262,6 +262,44 @@ def test_dicom_missing_series() -> None:
     print("PASS: test_dicom_missing_series")
 
 
+def test_synth_dicom_patient_roundtrip() -> None:
+    """End-to-end over the Track-A synthetic DICOM patient (if present)."""
+    import shutil
+    from src.io_unified import load_unified
+    from src.dicom_loader import prepare_for_inference
+
+    root = "/tmp/synth_dicom_patient"
+    if not os.path.isdir(root):
+        print("SKIP: test_synth_dicom_patient_roundtrip (no /tmp patient)")
+        return
+    scans, warnings = load_unified(root)
+    assert set(scans.volumes.keys()) == set(MODALITIES)
+    tensor, _ = prepare_for_inference(scans)
+    assert tensor.shape == (1, 4, 128, 128, 128)
+    # ZIP twin must behave identically.
+    zpath = "/tmp/synth_dicom_patient.zip"
+    if os.path.exists(zpath):
+        scans2, _ = load_unified(zpath)
+        assert set(scans2.volumes.keys()) == set(MODALITIES)
+    print("PASS: test_synth_dicom_patient_roundtrip")
+
+
+def test_dicom_grouping_sorts_by_instance() -> None:
+    """Same-basename slices across modalities must not interleave series."""
+    from src.dicom_loader import _discover_dicom_files, _group_dicom_series
+
+    root = "/tmp/synth_dicom_patient"
+    if not os.path.isdir(root):
+        print("SKIP: test_dicom_grouping_sorts_by_instance (no /tmp patient)")
+        return
+    files = _discover_dicom_files(root)
+    groups = _group_dicom_series(files)
+    assert len(groups) == 4
+    for uid, flist in groups.items():
+        assert len(flist) == 16, f"{uid}: {len(flist)}"
+    print("PASS: test_dicom_grouping_sorts_by_instance")
+
+
 def test_invalid_input_type() -> None:
     try:
         load_patient_scans(12345)  # type: ignore[arg-type]
@@ -280,5 +318,7 @@ if __name__ == "__main__":
     test_orientation_mismatch()
     test_dicom_directory_ingestion()
     test_dicom_missing_series()
+    test_synth_dicom_patient_roundtrip()
+    test_dicom_grouping_sorts_by_instance()
     test_invalid_input_type()
     print("\nAll ingestion engine tests PASSED.")

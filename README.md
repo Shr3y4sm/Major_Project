@@ -165,13 +165,69 @@ python -m src.verify_onnx \
 
 The command reports the active ONNX Runtime providers, maximum and mean absolute logit differences, and whether the maximum difference is within the requested tolerance.
 
-## Run Tests
+## Dual-input support (DICOM + NIfTI)
+
+`src/io_unified.py::load_unified()` is now the single entry point used by
+`app.py` for **both** hospital input families:
+
+| Input | Forms accepted |
+|---|---|
+| NIfTI | explicit `dict{t1,t1ce,t2,flair}`, list of 4 files, folder, or ZIP-of-NIfTIs |
+| DICOM | directory tree or ZIP of MR series (delegated to `dicom_loader`) |
+
+Hospital hardening on top of `load_patient_scans()`:
+
+- Expanded filename tokens: `t1-gad / t1gad / post / gad / t1c` → `t1ce`,
+  `t2w / mprage / bravo / flair-t2` etc.; `*seg*` sidecars are never mistaken
+  for input modalities.
+- Handles BraTS-portal style layouts where files sit inside directories
+  literally named `*.nii` (e.g. `BraTS2021_00495_t1.nii/00000209_brain_t1.nii`).
+- Optional **shape harmonization** (trilinear resample to `t1ce`) and
+  **RAS canonicalization** (axis flips) so near-miss hospital series warn
+  instead of hard-failing. Warnings are shown in the UI.
+- Optional **DICOM anonymization** checkbox (`src/anonymize.py`): PHI tags
+  stripped, geometry kept, `PatientID` replaced with a hash.
+
+## Radiology (A) + Surgical (B) outputs
+
+- **A — MPR viewer:** background choice (FLAIR/T1ce), overlay-opacity slider,
+  class toggles, true-volume slice sliders (no longer fixed 0–127), RANO-style
+  diameters, normal-scan banner when whole-tumor < 0.3 cm³, small-blob cleanup
+  slider (connected components).
+- **B — Surgical 3D + exports:** translucent brain + per-class tumor meshes
+  (class filter applies to 3D and MPR), per-label **STL** download
+  (zero new deps, `src/mesh_export.py`), combined **GLB** when `trimesh` is
+  installed, `segmentation.nii.gz` in reference space, printable **HTML report**
+  with MPR snapshots + volumetry + RANO + provenance.
 
 ```bash
-python -m pytest -q
+PYTHONPATH=. .venv/bin/python tests/test_unified.py
+PYTHONPATH=. .venv/bin/python tests/test_dicom_loader.py
 ```
 
 The current tests cover NIfTI dictionary/list ingestion, preprocessing output shape and metadata, synthetic DICOM ingestion, missing modalities, shape mismatch, orientation mismatch, and invalid input types.
+
+## Test DICOM data (1 patient, synthetic-from-BraTS, test-only)
+
+Real scanner DICOM requires a TCIA login (RIDER/TCGA-GBM via NBIA Data
+Retriever), so the repo ships a generator instead:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/make_synth_dicom_patient.py \
+  --src sample_brats_patient/BraTS2021_00495 \
+  --out /tmp/synth_dicom_patient --rows 64 --cols 64 --step 5
+cd /tmp && zip -qr synth_dicom_patient.zip synth_dicom_patient
+```
+
+This writes 4 valid DICOM series (AX T1 / AX T1C / AX T2 / AX FLAIR,
+16 slices each, proper SeriesInstanceUIDs) downsampled from `00495`.
+Both `load_unified(dir)` and `load_unified(zip)` ingest it; the DICOM e2e
+(prepare → ONNX → volumes) yields a small edema finding (~1.46 cm³).
+
+Public no-login extras: `pydicom`'s bundled `MR_small.dcm`
+(`.venv/.../pydicom/data/test_files/`, single-slice MR, parser check only).
+For true hospital headers, download 1 TCGA-GBM patient via NBIA and run it
+through the app with anonymization checked.
 
 ## Dataset and Notebook Workflow
 

@@ -241,7 +241,10 @@ def _is_dicom_file(path: str) -> bool:
 def _discover_dicom_files(root: str) -> list[str]:
     """Recursively find all DICOM files under a directory."""
     files: list[str] = []
-    for dirpath, _, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip our own conversion scratch dirs (symlinked copies) — they
+        # would otherwise double every series on a re-scan of the tree.
+        dirnames[:] = [d for d in dirnames if not d.startswith("convert_")]
         for f in filenames:
             full = os.path.join(dirpath, f)
             if _is_dicom_file(full):
@@ -300,10 +303,56 @@ def _infer_modality_from_dicom(meta: dict[str, object]) -> Optional[str]:
     return None
 
 
+def _sort_series_by_position(files: Sequence[str]) -> list[str]:
+    """Sort a series by InstanceNumber, falling back to IPP z, then name.
+
+    Conversion scratch dirs (``convert_*``) hold symlinks back into the
+    source tree — they must be excluded by the caller, but as a guard we
+    also de-duplicate on (SeriesUID-independent) SOPInstanceUID / path so
+    a re-scanned tree never yields doubled slices.
+    """
+    seen: set[str] = set()
+    uniq: list[str] = []
+    try:
+        import pydicom
+        for f in files:
+            try:
+                if os.path.islink(f):
+                    continue  # conversion scratch symlink, not source data
+                ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+                sop = str(ds.get("SOPInstanceUID") or f)
+            except Exception:
+                sop = f
+            if sop in seen:
+                continue
+            seen.add(sop)
+            uniq.append(f)
+    except Exception:
+        uniq = [f for f in files if not os.path.islink(f)]
+    def key(f: str) -> tuple:
+        try:
+            import pydicom
+            ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            inst = ds.get("InstanceNumber")
+            if inst is not None:
+                return (0, int(inst), f)
+            pos = ds.get("ImagePositionPatient")
+            if pos is not None and len(pos) >= 3:
+                return (1, float(pos[2]), f)
+        except Exception:
+            pass
+        return (2, 0.0, f)
+    return sorted(uniq, key=key)
+
+
 def _group_dicom_series(files: Sequence[str]) -> dict[str, list[str]]:
     """Group DICOM files by SeriesInstanceUID.
 
     Returns a mapping of series UID -> sorted list of file paths.
+    Sorting is by InstanceNumber (PACS-acquisition order), NOT by
+    lexicographic filename — filenames repeat across modalities
+    (e.g. `t1/slice_000.dcm` vs `t2/slice_000.dcm`) and naive sorting
+    interleaves series, breaking slice-continuity validation.
     """
     groups: dict[str, list[str]] = {}
     for f in files:
@@ -315,7 +364,7 @@ def _group_dicom_series(files: Sequence[str]) -> dict[str, list[str]]:
             )
         groups.setdefault(uid, []).append(f)
     for uid in groups:
-        groups[uid].sort()
+        groups[uid] = _sort_series_by_position(groups[uid])
     return groups
 
 
@@ -376,9 +425,10 @@ def _convert_dicom_series_to_nifti(
         # mirrors the force=True used in _read_dicom_series_metadata.
         d2n_settings.pydicom_read_force = True
 
-        # Unique scratch dir per series to avoid basename collisions
-        # between modalities (e.g. repeated `slice_000.dcm`).
-        scratch = tempfile.mkdtemp(dir=work_dir, prefix="convert_")
+        # Unique scratch dir OUTSIDE the source tree (temp dir), so a
+        # re-scan of the source tree never picks up our symlinks/outputs.
+        # (Scratch inside search_root caused series doubling on re-runs.)
+        scratch = tempfile.mkdtemp(prefix="brats_convert_")
         series_dir = os.path.join(scratch, "dicom")
         os.makedirs(series_dir, exist_ok=True)
         for f in series_files:
@@ -401,8 +451,15 @@ def _convert_dicom_series_to_nifti(
                 f"Expected a 3D volume from DICOM conversion, got shape {shape}."
             )
         affine = np.asarray(img.affine, dtype=np.float64)
+        import shutil
+        shutil.rmtree(scratch, ignore_errors=True)
         return data, affine
     except Exception as exc:
+        import shutil
+        try:
+            shutil.rmtree(scratch, ignore_errors=True)
+        except Exception:
+            pass
         raise DICOMCorruptError(
             f"Failed to convert DICOM series to NIfTI: {exc}"
         ) from exc

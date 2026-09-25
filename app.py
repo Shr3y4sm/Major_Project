@@ -29,21 +29,28 @@ import plotly.graph_objects as go
 from scipy.ndimage import gaussian_filter, zoom
 from skimage import measure
 
+from src.anonymize import anonymize_dicom_zip
 from src.dicom_loader import (
     IngestionError,
     PatientScans,
     SpatialMetadata,
-    load_patient_scans,
     prepare_for_inference,
 )
 from src.inference import ONNXInferenceEngine
+from src.io_unified import build_ingestion_report, load_unified
+from src.mesh_export import export_label_meshes, export_nifti_seg, try_export_glb
+from src.postprocess import cleanup_prediction, rano_diameters, tumor_flag
+from src.report import write_html_report
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-ONNX_PATH = "artifacts/unet3d.onnx"
+ONNX_CANDIDATES = ("artifacts/unet3d.onnx", "artifacts/best_unet.onnx")
+ONNX_PATH = next((p for p in ONNX_CANDIDATES if os.path.exists(p)),
+                 ONNX_CANDIDATES[0])
 TARGET_SIZE = 128
+NORMAL_WT_THRESHOLD_CM3 = 0.3  # below this -> normal/tiny banner
 
 CLASS_NAMES = {
     0: "Background",
@@ -164,7 +171,8 @@ def _compute_volumes(
     return volumes
 
 
-def _build_metrics_markdown(volumes: dict[str, float]) -> str:
+def _build_metrics_markdown(volumes: dict[str, float],
+                            flag: str = "") -> str:
     """Render the volumetric metrics as a clinical Markdown summary."""
     lines = [
         "### 📊 Quantitative Volumetric Analysis",
@@ -180,6 +188,11 @@ def _build_metrics_markdown(volumes: dict[str, float]) -> str:
         "> Volumes computed from original voxel spacing (mm³) mapped to "
         "physical space. Whole Tumor = Necrotic + Edema + Enhancing."
     )
+    if flag:
+        lines += ["", "> ⚠️ " + flag]
+    lines += ["",
+              "> 🧪 Research visualization only — not for diagnosis. "
+              "Requires radiologist verification."]
     return "\n".join(lines)
 
 
@@ -239,6 +252,7 @@ def _build_3d_plot(
     pred_orig: np.ndarray,
     t2_volume: np.ndarray,
     reference_seg: Optional[np.ndarray] = None,
+    show_classes: list[int] | None = None,
 ) -> go.Figure:
     """Build an interactive 3D surface rendering of tumour classes.
 
@@ -280,6 +294,9 @@ def _build_3d_plot(
     # Use native BraTS label 4 for enhancing when a ground-truth sidecar exists.
     segmentation = reference_seg if reference_seg is not None else pred_orig
     class_ids = (1, 2, 4) if reference_seg is not None else (1, 2, 3)
+    if show_classes is not None:
+        wanted = set(show_classes)
+        class_ids = tuple(c for c in class_ids if c in wanted or (c == 4 and 3 in wanted))
 
     # Tumour class surfaces. Only run marching_cubes when the class mask
     # contains at least one voxel — evaluates the boolean mask explicitly
@@ -334,8 +351,13 @@ def _build_3d_plot(
 def _overlay_segmentation(
     scan_slice: np.ndarray,
     pred_slice: np.ndarray,
+    opacity: float = 0.8,
+    show_classes: list[int] | None = None,
 ) -> np.ndarray:
     """Blend a segmentation overlay onto a grayscale scan slice (RGB)."""
+    if show_classes is None:
+        show_classes = [1, 2, 3]
+    alpha_scale = float(np.clip(opacity, 0.0, 1.0)) / (200 / 255)
     # Normalize scan slice to [0, 1].
     s_min, s_max = scan_slice.min(), scan_slice.max()
     if s_max - s_min < 1e-8:
@@ -346,11 +368,15 @@ def _overlay_segmentation(
     rgb = np.stack([gray, gray, gray], axis=-1)
 
     for cls_id, (r, g, b, a) in MPR_COLORS.items():
+        mapped = 3 if cls_id == 4 else cls_id
+        if mapped not in show_classes:
+            continue
         mask = pred_slice == cls_id
         if mask.any():
-            rgb[mask, 0] = rgb[mask, 0] * (1 - a / 255) + (r / 255) * (a / 255)
-            rgb[mask, 1] = rgb[mask, 1] * (1 - a / 255) + (g / 255) * (a / 255)
-            rgb[mask, 2] = rgb[mask, 2] * (1 - a / 255) + (b / 255) * (a / 255)
+            a_eff = min(255, int(a * alpha_scale))
+            rgb[mask, 0] = rgb[mask, 0] * (1 - a_eff / 255) + (r / 255) * (a_eff / 255)
+            rgb[mask, 1] = rgb[mask, 1] * (1 - a_eff / 255) + (g / 255) * (a_eff / 255)
+            rgb[mask, 2] = rgb[mask, 2] * (1 - a_eff / 255) + (b / 255) * (a_eff / 255)
 
     return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
@@ -361,6 +387,8 @@ def _build_mpr_plot(
     axial_idx: int,
     sagittal_idx: int,
     coronal_idx: int,
+    opacity: float = 0.8,
+    show_classes: list[int] | None = None,
 ) -> go.Figure:
     """Build a 3-panel MPR viewer with segmentation overlays.
 
@@ -378,9 +406,12 @@ def _build_mpr_plot(
     sagittal_idx = int(np.clip(sagittal_idx, 0, W - 1))
     coronal_idx = int(np.clip(coronal_idx, 0, H - 1))
 
-    axial = _overlay_segmentation(scan_volume[axial_idx], pred_orig[axial_idx])
-    sagittal = _overlay_segmentation(scan_volume[:, :, sagittal_idx], pred_orig[:, :, sagittal_idx])
-    coronal = _overlay_segmentation(scan_volume[:, coronal_idx, :], pred_orig[:, coronal_idx, :])
+    axial = _overlay_segmentation(scan_volume[axial_idx], pred_orig[axial_idx],
+                                  opacity, show_classes)
+    sagittal = _overlay_segmentation(scan_volume[:, :, sagittal_idx], pred_orig[:, :, sagittal_idx],
+                                     opacity, show_classes)
+    coronal = _overlay_segmentation(scan_volume[:, coronal_idx, :], pred_orig[:, coronal_idx, :],
+                                    opacity, show_classes)
 
     fig = go.Figure()
     fig.add_trace(go.Image(z=axial, name="Axial", xaxis="x", yaxis="y", hoverinfo="skip"))
@@ -408,9 +439,100 @@ def _build_mpr_plot(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Main handler
-# ---------------------------------------------------------------------------
+def _snapshot_mpr_pngs(scan_volume: np.ndarray, pred_orig: np.ndarray,
+                     out_dir: str) -> list[str]:
+    """Save axial/sagittal/coronal overlay PNGs for the HTML report."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+    os.makedirs(out_dir, exist_ok=True)
+    D, H, W = pred_orig.shape
+    views = [
+        ("axial", _overlay_segmentation(scan_volume[D // 2],
+                                        pred_orig[D // 2])),
+        ("sagittal", _overlay_segmentation(scan_volume[:, :, W // 2],
+                                           pred_orig[:, :, W // 2])),
+        ("coronal", _overlay_segmentation(scan_volume[:, H // 2, :],
+                                          pred_orig[:, H // 2, :])),
+    ]
+    paths = []
+    for name, rgb in views:
+        p = os.path.join(out_dir, f"mpr_{name}.png")
+        plt.imsave(p, rgb)
+        paths.append(p)
+    return paths
+
+
+def _run_pipeline(input_source: str | dict,
+                  axial_idx: int, sagittal_idx: int, coronal_idx: int,
+                  bg_modality: str, overlay_opacity: float,
+                  show_classes: list[int], cleanup_min_vox: int):
+    """Shared pipeline for NIfTI + DICOM. Returns all UI outputs."""
+    import tempfile
+    workdir = tempfile.mkdtemp(prefix="brats_out_")
+    scans, warnings = load_unified(input_source, harmonize=True,
+                                   ras_canonical=True, reference="t1ce")
+    tensor, metadata = prepare_for_inference(scans, target_size=TARGET_SIZE)
+    engine = _get_engine()
+    pred_128 = engine.predict_class_map(tensor)
+    pred_orig = _resample_prediction_to_original(pred_128, metadata)
+    if cleanup_min_vox > 0:
+        pred_orig = cleanup_prediction(pred_orig, min_voxels=cleanup_min_vox)
+    volumes = _compute_volumes(pred_orig, metadata)
+    flag = tumor_flag(volumes, threshold_cm3=NORMAL_WT_THRESHOLD_CM3)
+    metrics_md = _build_metrics_markdown(volumes, flag)
+
+    scan_volume = scans.volumes.get(bg_modality, scans.volumes["flair"])
+    ref = None
+    if isinstance(input_source, dict):
+        ref = _load_reference_segmentation(input_source,
+                                           scans.volumes["t2"].shape)
+    seg_for_viz = ref if ref is not None else pred_orig
+    plot_3d = _build_3d_plot(seg_for_viz, scans.volumes["t2"],
+                             None, show_classes=show_classes)
+    plot_mpr = _build_mpr_plot(scan_volume, seg_for_viz, axial_idx,
+                               sagittal_idx, coronal_idx,
+                               opacity=overlay_opacity,
+                               show_classes=show_classes)
+    # Exports
+    t2_meta = metadata["t2"]
+    spacing = tuple(float(s) for s in t2_meta.voxel_spacing_mm)
+    stl_paths = export_label_meshes(pred_orig, os.path.join(workdir, "stl"),
+                                    spacing=spacing)
+    glb_path = try_export_glb(pred_orig, os.path.join(workdir, "tumor.glb"),
+                              spacing=spacing)
+    ref_key = "flair" if "flair" in scans.metadata else "t1ce"
+    nifti_path = os.path.join(workdir, "segmentation.nii.gz")
+    try:
+        from src.io_unified import discover_nifti_files  # noqa
+        export_nifti_seg(pred_orig, _reference_path_for_export(
+            input_source, ref_key), nifti_path)
+    except Exception:
+        nib.save(nib.Nifti1Image(pred_orig.astype(np.int16), np.eye(4)),
+                 nifti_path)
+    snaps = _snapshot_mpr_pngs(scan_volume, seg_for_viz, workdir)
+    rano = rano_diameters(np.isin(pred_orig, [1, 2, 3]), spacing)
+    report = write_html_report(os.path.join(workdir, "report.html"), volumes,
+                               rano, snaps,
+                               build_ingestion_report(warnings)
+                               + f"\nModel: {ONNX_PATH}",
+                               scans.source)
+    stl_list = [stl_paths[k] for k in sorted(stl_paths)]
+    warn_md = ("### ℹ️ Ingestion\n\n" + build_ingestion_report(warnings)
+               if warnings else "")
+    if flag:
+        warn_md += ("\n\n> ⚠️ " + flag)
+    downloads = stl_list + ([glb_path] if glb_path else []) + [nifti_path]
+    return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
+
+
+def _reference_path_for_export(input_source, ref_key: str) -> str:
+    if isinstance(input_source, dict):
+        return input_source[ref_key]
+    raise ValueError("no reference path for DICOM input")
 
 
 def run_analysis(
@@ -419,76 +541,59 @@ def run_analysis(
     t1ce_file: Optional[gr.File],
     t2_file: Optional[gr.File],
     flair_file: Optional[gr.File],
+    nifti_folder: Optional[gr.File],
     zip_file: Optional[gr.File],
     axial_idx: int,
     sagittal_idx: int,
     coronal_idx: int,
-) -> tuple[go.Figure, go.Figure, str, str]:
+    bg_modality: str,
+    overlay_opacity: float,
+    show_classes: list[int],
+    cleanup_min_vox: int,
+    anonymize: bool,
+) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None]:
     """Run the full analysis pipeline and return visual + text outputs.
 
     Returns:
-        (plot_3d, plot_mpr, metrics_md, error_md)
+        (plot_3d, plot_mpr, metrics_md, warn_md, report_html, downloads)
     """
     error_md = ""
     try:
-        # --- Build input source ---
+        # --- Build input source (BOTH DICOM + NIfTI compatible) ---
         if mode == "NIfTI Files":
-            if not all([t1_file, t1ce_file, t2_file, flair_file]):
-                raise ValueError(
-                    "Please upload all 4 NIfTI files (T1, T1ce, T2, FLAIR)."
-                )
-            input_source = {
-                "t1": t1_file.name,
-                "t1ce": t1ce_file.name,
-                "t2": t2_file.name,
-                "flair": flair_file.name,
-            }
-        else:  # DICOM ZIP
+            if nifti_folder is not None:
+                input_source = nifti_folder.name  # folder or ZIP bundle
+            else:
+                if not all([t1_file, t1ce_file, t2_file, flair_file]):
+                    raise ValueError(
+                        "Upload all 4 NIfTI files (T1, T1ce, T2, FLAIR) "
+                        "or a single NIfTI folder/ZIP."
+                    )
+                input_source = {
+                    "t1": t1_file.name,
+                    "t1ce": t1ce_file.name,
+                    "t2": t2_file.name,
+                    "flair": flair_file.name,
+                }
+        else:  # DICOM ZIP / folder
             if zip_file is None:
-                raise ValueError("Please upload a ZIP archive containing DICOM series.")
+                raise ValueError(
+                    "Please upload a ZIP archive (or folder export) "
+                    "containing DICOM series."
+                )
             input_source = zip_file.name
+            if anonymize:
+                try:
+                    input_source = anonymize_dicom_zip(input_source)
+                except Exception as exc:
+                    raise ValueError(
+                        f"DICOM anonymization failed: {exc}") from exc
 
-        # --- Ingest + preprocess ---
-        scans: PatientScans = load_patient_scans(input_source)
-        tensor, metadata = prepare_for_inference(scans, target_size=TARGET_SIZE)
-
-        # --- Inference ---
-        engine = _get_engine()
-        pred_128 = engine.predict_class_map(tensor)  # (128,128,128) int16
-
-        # --- Resample prediction to original space ---
-        pred_orig = _resample_prediction_to_original(pred_128, metadata)
-
-        # BraTS folders commonly contain the ground-truth sidecar without
-        # requiring it to be uploaded as a fifth input.
-        reference_seg = _load_reference_segmentation(
-            input_source, scans.volumes["t2"].shape
-        ) if isinstance(input_source, dict) else None
-
-        # --- Volumetric metrics ---
-        volumes = _compute_volumes(pred_orig, metadata)
-        metrics_md = _build_metrics_markdown(volumes)
-
-        # --- 3D surface rendering ---
-        t2_volume = scans.volumes["t2"]
-        plot_3d = _build_3d_plot(pred_orig, t2_volume, reference_seg)
-
-        # --- MPR viewer (FLAIR preferred, fallback T1ce) ---
-        # NOTE: never use `volumes.get("flair") or volumes["t1ce"]` here —
-        # both are NumPy arrays whose truthiness raises the "ambiguous"
-        # ValueError. Use an explicit None-check instead.
-        scan_volume = scans.volumes.get("flair")
-        if scan_volume is None:
-            scan_volume = scans.volumes["t1ce"]
-        plot_mpr = _build_mpr_plot(
-            scan_volume,
-            reference_seg if reference_seg is not None else pred_orig,
-            axial_idx,
-            sagittal_idx,
-            coronal_idx,
-        )
-
-        return plot_3d, plot_mpr, metrics_md, error_md
+        plot_3d, plot_mpr, metrics_md, warn_md, report, downloads = \
+            _run_pipeline(input_source, axial_idx, sagittal_idx, coronal_idx,
+                          bg_modality.lower(), overlay_opacity,
+                          [int(c) for c in show_classes], cleanup_min_vox)
+        return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
 
     except IngestionError as exc:
         error_md = f"### ⚠️ Ingestion Error\n\n{exc}"
@@ -503,7 +608,7 @@ def run_analysis(
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
         font=dict(color="white"), title="No data to display",
     )
-    return empty_fig, empty_fig, "", error_md
+    return empty_fig, empty_fig, "", error_md, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +623,10 @@ def build_app() -> gr.Blocks:
             # 🧠 Brain Tumour Segmentation — Clinical Workflow
             **Multi-modal MRI (T1, T1ce, T2, FLAIR) → 3D UNet → Volumetric Analysis**
 
-            Upload either **4 NIfTI files** or a **ZIP of DICOM series** to run
-            automated tumour segmentation with quantitative volume reporting.
+            **A (Radiology):** MPR viewer with overlay opacity + background
+            choice + volumetry. **B (Surgery):** in-situ 3D + STL/GLB export
+            + printable report. Accepts **NIfTI x4 / folder / ZIP** and
+            **DICOM folder / ZIP**.
             """
         )
 
@@ -528,7 +635,7 @@ def build_app() -> gr.Blocks:
                 mode = gr.Radio(
                     choices=["NIfTI Files", "DICOM ZIP"],
                     value="NIfTI Files",
-                    label="Input Mode",
+                    label="Input Mode (DICOM + NIfTI compatible)",
                 )
 
                 with gr.Group(visible=True) as nifti_group:
@@ -536,26 +643,49 @@ def build_app() -> gr.Blocks:
                     t1ce_file = gr.File(label="T1ce (NIfTI)", file_types=[".nii", ".nii.gz"])
                     t2_file = gr.File(label="T2 (NIfTI)", file_types=[".nii", ".nii.gz"])
                     flair_file = gr.File(label="FLAIR (NIfTI)", file_types=[".nii", ".nii.gz"])
+                    nifti_folder = gr.File(
+                        label="…or NIfTI folder/ZIP bundle (optional override)",
+                        file_types=[".zip"])
 
                 with gr.Group(visible=False) as zip_group:
-                    zip_file = gr.File(label="DICOM ZIP Archive", file_types=[".zip"])
+                    zip_file = gr.File(label="DICOM ZIP / folder export (.zip)",
+                                       file_types=[".zip"])
+                    anonymize = gr.Checkbox(
+                        value=True,
+                        label="Anonymize DICOM on upload (strip PHI, keep geometry)")
 
                 run_btn = gr.Button("▶ Run Analysis", variant="primary")
 
-                with gr.Accordion("MPR Slice Controls", open=True):
-                    axial_slider = gr.Slider(0, 127, value=64, step=1, label="Axial Slice")
-                    sagittal_slider = gr.Slider(0, 127, value=64, step=1, label="Sagittal Slice")
-                    coronal_slider = gr.Slider(0, 127, value=64, step=1, label="Coronal Slice")
+                with gr.Accordion("A — MPR Slice Controls", open=True):
+                    axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial Slice")
+                    sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal Slice")
+                    coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal Slice")
+                    bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR",
+                                           label="MPR background")
+                    overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05,
+                                                label="Overlay opacity")
+
+                with gr.Accordion("A+B — Classes + Cleanup", open=True):
+                    show_classes = gr.CheckboxGroup(
+                        [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2),
+                         (CLASS_NAMES[3], 3)],
+                        value=[1, 2, 3], label="Show classes (3D + MPR)")
+                    cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
+                                                label="Remove blobs smaller than (voxels)")
 
             with gr.Column(scale=3):
                 error_md = gr.Markdown("")
                 metrics_md = gr.Markdown("")
 
                 with gr.Tabs():
-                    with gr.Tab("3D Surface"):
+                    with gr.Tab("3D Surface (B — surgical)"):
                         plot_3d = gr.Plot(label="3D Tumour Surface")
-                    with gr.Tab("MPR 2D Viewer"):
+                    with gr.Tab("MPR 2D Viewer (A — radiology)"):
                         plot_mpr = gr.Plot(label="Multi-Planar Reconstruction")
+
+                with gr.Accordion("B — Exports (STL/GLB + NIfTI-seg + report)", open=False):
+                    report_html = gr.File(label="Surgical / radiology report (HTML)")
+                    downloads = gr.Files(label="Meshes + segmentation downloads")
 
         # Toggle input groups based on mode.
         def _toggle_mode(selected: str) -> tuple[dict, dict]:
@@ -573,10 +703,13 @@ def build_app() -> gr.Blocks:
             run_analysis,
             inputs=[
                 mode,
-                t1_file, t1ce_file, t2_file, flair_file, zip_file,
+                t1_file, t1ce_file, t2_file, flair_file, nifti_folder, zip_file,
                 axial_slider, sagittal_slider, coronal_slider,
+                bg_modality, overlay_opacity, show_classes, cleanup_min_vox,
+                anonymize,
             ],
-            outputs=[plot_3d, plot_mpr, metrics_md, error_md],
+            outputs=[plot_3d, plot_mpr, metrics_md, error_md,
+                     report_html, downloads],
         )
 
     return demo

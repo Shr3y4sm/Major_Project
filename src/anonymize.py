@@ -1,0 +1,78 @@
+"""PHI anonymization for DICOM (upload) and NIfTI (filenames)."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
+
+__all__ = ["anonymize_dicom_tree", "anonymize_dicom_zip", "clean_display_name"]
+
+# DICOM tags to REMOVE (PHI). Geometry + series description kept.
+_REMOVE_KEYWORDS = [
+    "PatientName", "PatientID", "PatientBirthDate", "PatientSex",
+    "PatientAge", "PatientAddress", "PatientTelephoneNumbers",
+    "InstitutionName", "InstitutionAddress", "ReferringPhysicianName",
+    "PerformingPhysicianName", "OperatorsName", "PhysiciansOfRecord",
+    "StudyID", "AccessionNumber",
+]
+
+
+def _hash_id(value: str, salt: str = "brats-mvp") -> str:
+    return "ANON-" + hashlib.sha256(
+        f"{salt}:{value}".encode()).hexdigest()[:12].upper()
+
+
+def anonymize_dicom_tree(src_dir: str, dst_dir: str | None = None) -> str:
+    """Copy DICOM tree to dst (or tmp) with PHI tags removed. Returns dst."""
+    import pydicom
+
+    if dst_dir is None:
+        dst_dir = tempfile.mkdtemp(prefix="anon_dicom_")
+    os.makedirs(dst_dir, exist_ok=True)
+    for root, _, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        out_root = os.path.join(dst_dir, rel)
+        os.makedirs(out_root, exist_ok=True)
+        for f in files:
+            src = os.path.join(root, f)
+            dst = os.path.join(out_root, f)
+            try:
+                ds = pydicom.dcmread(src, force=True)
+            except Exception:
+                shutil.copy2(src, dst)  # non-DICOM: copy as-is
+                continue
+            for kw in _REMOVE_KEYWORDS:
+                if kw in ds:
+                    del ds[kw]
+            try:
+                pid = str(ds.get("PatientID", "unknown"))
+            except Exception:
+                pid = "unknown"
+            ds.PatientID = _hash_id(pid)
+            ds.PatientName = "ANONYMIZED"
+            ds.save_as(dst)
+    return dst_dir
+
+
+def anonymize_dicom_zip(zip_path: str) -> str:
+    """Anonymize a DICOM ZIP -> new anonymized ZIP path (in tmp)."""
+    tmp = tempfile.mkdtemp(prefix="anon_src_")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(tmp)
+    anon_dir = tempfile.mkdtemp(prefix="anon_out_")
+    anonymize_dicom_tree(tmp, anon_dir)
+    out_zip = os.path.join(tempfile.gettempdir(), "anonymized_upload.zip")
+    if os.path.exists(out_zip):
+        os.remove(out_zip)
+    shutil.make_archive(out_zip.replace(".zip", ""), "zip", anon_dir)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return out_zip
+
+
+def clean_display_name(path: str) -> str:
+    """Strip PHI-ish folder prefixes for UI display; keep filename."""
+    return Path(path).name
