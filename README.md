@@ -229,6 +229,17 @@ Public no-login extras: `pydicom`'s bundled `MR_small.dcm`
 For true hospital headers, download 1 TCGA-GBM patient via NBIA and run it
 through the app with anonymization checked.
 
+## Real scanner DICOM already in repo (`DICOM.zip`)
+
+`DICOM.zip` (4.6 MB, Zenodo 16956 — normal head, Macclesfield Hospital) holds
+64 MR files in 3 series: `Survey_MST` scout (5, skipped), `T2W_TSE` → `t2`
+(27), `T1W_FFE` → `t1` (32). The tumor pipeline needs 4 modalities, so this
+ZIP **correctly** raises
+`MissingModalityError: ['t1ce','flair'] ... Skipped scout ... 'Survey_MST'`
+— covered by `test_real_dicom_zip_two_modalities`. Its converted volumes are
+`T2 (256,256,27)` and `T1 (256,32,256)` (sagittal acquisition).
+Full tumor e2e runs on `BRATS/BraTS20_Training_002_*` (4-modality NIfTI).
+
 ## Dataset and Notebook Workflow
 
 `src/preprocessing.py` retains the Phase 1 dataset helpers for local BraTS folders, Kaggle-mounted data, and training archives. Set `BRATS_LOCAL_ROOT` when using a local BraTS dataset root:

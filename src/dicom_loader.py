@@ -64,11 +64,19 @@ MODALITY_ORDER: tuple[str, ...] = tuple(MODALITIES)
 # shorter ones), because matching is substring-based for DICOM metadata
 # and "AX T1C" would otherwise be misclassified as `t1`.
 _MODALITY_TOKENS: dict[str, tuple[str, ...]] = {
-    "t1ce": ("t1ce", "t1c", "t1 post", "t1 contrast"),
-    "t1": ("t1", "t1w", "t1 weighted"),
-    "t2": ("t2", "t2w", "t2 weighted"),
+    "t1ce": ("t1ce", "t1c", "t1 post", "t1 contrast", "t1-gad", "t1gad",
+             "postgad", "post-gad", "post gad", "gad"),
+    "t1": ("t1", "t1w", "t1 weighted", "t1w_ffe", "t1w ffe", "mprage",
+           "t1 ffe", "t1ffe"),
+    "t2": ("t2", "t2w", "t2 weighted", "t2w_tse", "t2w tse", "t2 tse",
+           "t2tse"),
     "flair": ("flair", "t2 flair", "t2flair"),
 }
+
+# Series descriptions that are scouts/localizers/surveys, not diagnostic
+# modalities. These are SKIPPED (not errors) during DICOM ingestion.
+_SCOUT_TOKENS = ("survey", "scout", "localizer", "loc", "topogram",
+                 "plan", "calibration", "mpr", "mst", "pilot")
 
 # DICOM file extensions (case-insensitive).
 _DICOM_EXTS = {".dcm", ".dicom", ".ima"}
@@ -292,10 +300,16 @@ def _read_dicom_series_metadata(dcm_path: str) -> dict[str, object]:
 
 
 def _infer_modality_from_dicom(meta: dict[str, object]) -> Optional[str]:
-    """Infer modality from DICOM series description/protocol/image type."""
+    """Infer modality from DICOM series description/protocol/image type.
+
+    Returns ``'__scout__'`` for localizer/survey series (to be skipped),
+    a modality key for diagnostic series, or ``None`` when unrecognized.
+    """
     haystack = " ".join(
         str(meta.get(k) or "") for k in ("series_desc", "protocol", "image_type")
     ).lower()
+    if any(tok in haystack for tok in _SCOUT_TOKENS):
+        return "__scout__"
     for mod, tokens in _MODALITY_TOKENS.items():
         for tok in tokens:
             if tok in haystack:
@@ -371,24 +385,57 @@ def _group_dicom_series(files: Sequence[str]) -> dict[str, list[str]]:
 def _validate_slice_continuity(files: Sequence[str]) -> None:
     """Validate that a DICOM series has continuous, uniformly spaced slices.
 
-    Checks that ImagePositionPatient z-coordinates are monotonic with
-    near-constant spacing.
+    Checks that slice positions are monotonic with near-constant spacing
+    ALONG THE SERIES NORMAL (projection of ImagePositionPatient onto the
+    slice normal from ImageOrientationPatient), not raw z. Multi-orientation
+    localizers (e.g. 3-plane surveys) project to a constant and are
+    reported as non-stackable rather than "non-monotonic".
     """
-    positions: list[float] = []
+    origins: list[np.ndarray] = []
+    normal: np.ndarray | None = None
     for f in files:
-        meta = _read_dicom_series_metadata(f)
-        pos = meta.get("position")
-        if pos is None or len(pos) < 3:
+        try:
+            import pydicom
+            ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            pos = ds.get("ImagePositionPatient")
+            ori = ds.get("ImageOrientationPatient")
+            if pos is None or len(pos) < 3:
+                raise SliceContinuityError(
+                    f"DICOM file '{f}' is missing ImagePositionPatient; "
+                    "cannot verify slice continuity."
+                )
+            origins.append(np.asarray([float(pos[0]), float(pos[1]),
+                                       float(pos[2])]))
+            if normal is None and ori is not None and len(ori) >= 6:
+                r = np.asarray([float(ori[0]), float(ori[1]), float(ori[2])])
+                c = np.asarray([float(ori[3]), float(ori[4]), float(ori[5])])
+                normal = np.cross(r, c)
+                n = float(np.linalg.norm(normal))
+                normal = normal / n if n > 1e-12 else None
+        except SliceContinuityError:
+            raise
+        except Exception as exc:
             raise SliceContinuityError(
-                f"DICOM file '{f}' is missing ImagePositionPatient; "
-                "cannot verify slice continuity."
-            )
-        positions.append(float(pos[2]))
+                f"Failed to read slice position of '{f}': {exc}") from exc
 
-    if len(positions) < 2:
+    if len(origins) < 2:
         return  # Single-slice series: nothing to compare.
 
-    diffs = np.diff(np.asarray(positions, dtype=np.float64))
+    if normal is None:
+        axis = int(np.argmax(np.ptp(np.stack(origins), axis=0)))
+        positions = np.asarray([o[axis] for o in origins], dtype=np.float64)
+    else:
+        positions = np.asarray([float(o @ normal) for o in origins],
+                               dtype=np.float64)
+
+    if float(np.ptp(positions)) < 1e-6:
+        raise SliceContinuityError(
+            "DICOM series is a multi-orientation localizer/survey "
+            "(no stackable slice axis); it cannot be reconstructed as a "
+            "3D volume. Exclude scout series and retry."
+        )
+
+    diffs = np.diff(positions)
     if np.any(diffs <= 0):
         raise SliceContinuityError(
             "DICOM series has non-monotonic slice positions; "
@@ -484,11 +531,18 @@ def _load_dicom_root(root: str) -> PatientScans:
 
         groups = _group_dicom_series(files)
 
-        # Map each series to a modality.
+        # Map each series to a modality (scouts skipped, not errors).
+        # Continuity is validated per DIAGNOSTIC series only: scouts are
+        # multi-orientation localizers and never stackable.
         series_modality: dict[str, str] = {}
+        skipped_scouts: list[str] = []
         for uid, series_files in groups.items():
             meta = _read_dicom_series_metadata(series_files[0])
             mod = _infer_modality_from_dicom(meta)
+            if mod == "__scout__":
+                skipped_scouts.append(
+                    f"{meta.get('series_desc')!r} ({len(series_files)} slices)")
+                continue
             if mod is None:
                 raise IngestionError(
                     f"Cannot infer modality for DICOM series '{uid}' "
@@ -505,9 +559,12 @@ def _load_dicom_root(root: str) -> PatientScans:
         # Validate completeness.
         missing = [m for m in MODALITY_ORDER if m not in series_modality]
         if missing:
+            scout_note = (f" Skipped scout/localizer series: "
+                          f"{'; '.join(skipped_scouts)}." if skipped_scouts else "")
             raise MissingModalityError(
                 f"Missing DICOM series for modality/modalities: {missing}. "
-                f"Found series: {sorted(series_modality.keys())}"
+                f"Found series: {sorted(series_modality.keys())}."
+                + scout_note
             )
 
         # Convert each series and validate.

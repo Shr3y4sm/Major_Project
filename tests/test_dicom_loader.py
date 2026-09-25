@@ -288,16 +288,71 @@ def test_dicom_grouping_sorts_by_instance() -> None:
     """Same-basename slices across modalities must not interleave series."""
     from src.dicom_loader import _discover_dicom_files, _group_dicom_series
 
-    root = "/tmp/synth_dicom_patient"
-    if not os.path.isdir(root):
-        print("SKIP: test_dicom_grouping_sorts_by_instance (no /tmp patient)")
+    for root, want_n in (("/tmp/synth_dicom_patient", 16), ("BRATS", None)):
+        if not os.path.isdir(root):
+            continue
+        if root == "BRATS":
+            print("SKIP: BRATS is NIfTI, grouping test needs DICOM dir")
+            continue
+        files = _discover_dicom_files(root)
+        groups = _group_dicom_series(files)
+        assert len(groups) == 4
+        for uid, flist in groups.items():
+            assert len(flist) == want_n, f"{uid}: {len(flist)}"
+        print("PASS: test_dicom_grouping_sorts_by_instance")
         return
-    files = _discover_dicom_files(root)
-    groups = _group_dicom_series(files)
-    assert len(groups) == 4
-    for uid, flist in groups.items():
-        assert len(flist) == 16, f"{uid}: {len(flist)}"
-    print("PASS: test_dicom_grouping_sorts_by_instance")
+    print("SKIP: test_dicom_grouping_sorts_by_instance (no DICOM dir)")
+
+
+def test_real_dicom_zip_two_modalities() -> None:
+    """Real scanner ZIP (DICOM.zip): T1+T2 found, scout skipped, t1ce/flair missing."""
+    import zipfile
+    from src.io_unified import load_unified
+    from src.dicom_loader import (MissingModalityError, _discover_dicom_files,
+                                  _group_dicom_series,
+                                  _read_dicom_series_metadata,
+                                  _infer_modality_from_dicom,
+                                  _validate_slice_continuity)
+
+    zpath = "DICOM.zip"
+    if not os.path.exists(zpath) or not zipfile.is_zipfile(zpath):
+        print("SKIP: test_real_dicom_zip_two_modalities (no DICOM.zip)")
+        return
+    # Header-level audit straight from the ZIP (no extraction needed).
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="realaudit_")
+    with zipfile.ZipFile(zpath) as zf:
+        zf.extractall(tmp)
+    try:
+        files = _discover_dicom_files(tmp)
+        assert len(files) == 64, f"expected 64 MR files, got {len(files)}"
+        groups = _group_dicom_series(files)
+        assert len(groups) == 3, f"expected 3 series, got {len(groups)}"
+        mods = {}
+        for uid, flist in groups.items():
+            meta = _read_dicom_series_metadata(flist[0])
+            mods[meta["series_desc"]] = _infer_modality_from_dicom(meta)
+        assert mods.get("Survey_MST") == "__scout__", mods
+        assert mods.get("T2W_TSE") == "t2", mods
+        assert mods.get("T1W_FFE") == "t1", mods
+        # Diagnostic series validate; scout is multi-orientation (skipped).
+        for uid, flist in groups.items():
+            meta = _read_dicom_series_metadata(flist[0])
+            if meta["series_desc"] == "Survey_MST":
+                continue
+            _validate_slice_continuity(flist)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Full pipeline must fail CLEANLY with missing t1ce/flair (not a crash).
+    try:
+        load_unified(zpath)
+        raise AssertionError("expected MissingModalityError for t1ce/flair")
+    except MissingModalityError as exc:
+        msg = str(exc)
+        assert "t1ce" in msg and "flair" in msg, msg
+        assert "Survey_MST" in msg, msg  # scout-skip note present
+    print("PASS: test_real_dicom_zip_two_modalities")
 
 
 def test_invalid_input_type() -> None:
@@ -320,5 +375,6 @@ if __name__ == "__main__":
     test_dicom_missing_series()
     test_synth_dicom_patient_roundtrip()
     test_dicom_grouping_sorts_by_instance()
+    test_real_dicom_zip_two_modalities()
     test_invalid_input_type()
     print("\nAll ingestion engine tests PASSED.")

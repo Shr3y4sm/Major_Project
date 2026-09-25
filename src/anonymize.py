@@ -48,6 +48,15 @@ def anonymize_dicom_tree(src_dir: str, dst_dir: str | None = None) -> str:
             for kw in _REMOVE_KEYWORDS:
                 if kw in ds:
                     del ds[kw]
+            # Drop group-0000 command elements: illegal in stored files and
+            # present in some raw dumps (this real Zenodo ZIP has them).
+            # Iterate over a snapshot since we delete during iteration.
+            for tag in list(ds.keys()):
+                try:
+                    if int(tag.group) == 0:
+                        del ds[tag]
+                except Exception:
+                    pass
             try:
                 pid = str(ds.get("PatientID", "unknown"))
             except Exception:
