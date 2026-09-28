@@ -74,11 +74,15 @@ def anonymize_dicom_zip(zip_path: str) -> str:
         zf.extractall(tmp)
     anon_dir = tempfile.mkdtemp(prefix="anon_out_")
     anonymize_dicom_tree(tmp, anon_dir)
-    out_zip = os.path.join(tempfile.gettempdir(), "anonymized_upload.zip")
-    if os.path.exists(out_zip):
-        os.remove(out_zip)
+    # Unique per-call name: the old fixed "anonymized_upload.zip" raced when
+    # two users uploaded concurrently.
+    fd, out_zip = tempfile.mkstemp(prefix="anonymized_upload_",
+                                   suffix=".zip")
+    os.close(fd)
+    os.remove(out_zip)
     shutil.make_archive(out_zip.replace(".zip", ""), "zip", anon_dir)
     shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(anon_dir, ignore_errors=True)
     return out_zip
 
 

@@ -1,0 +1,16 @@
+# Keep model weights, patient data and notebooks out of the image.
+artifacts/
+sample_brats_patient/
+DICOM.zip
+*.nii
+*.nii.gz
+*.zip
+braintumour-phase-1.ipynb
+previous/
+tmp_test_data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.env

@@ -56,29 +56,75 @@ ONNX Runtime 3D U-Net
 Class map -> original-space reconstruction -> volumes and visualizations
 ```
 
-## Repository Structure
+## Run the App
+
+```bash
+# Local (CPU fallback automatic; CUDA used when available)
+PYTHONPATH=. .venv/bin/python app.py
+# → http://127.0.0.1:7860  (override with APP_HOST / APP_PORT, see .env.example)
+
+# Docker (weights + config mounted at runtime, never baked into the image)
+docker build -t brats-seg .
+docker run --rm -p 7860:7860 \
+  -v /host/path/artifacts:/app/artifacts:ro \
+  -e BRATSIFY=1 -e ARTIFACT_RETENTION_HOURS=24 \
+  brats-seg
+```
+
+### Hospital / lab / clinic deployment notes
+
+- **Model weights are NOT in this repo** (`artifacts/` is git-ignored).
+  Export them on the deployment machine from the trained checkpoint:
+  `python -m src.export_onnx --checkpoint /secure/best_unet.pt --output artifacts/best_unet.onnx`,
+  then `python -m src.verify_onnx`. A `*.PLACEHOLDER` marker next to the
+  `.onnx`/`.pt` means untrained dummy weights — the UI shows a 🚨 banner.
+- **Patient data stays out of git** (`*.nii`, `*.zip`, sample patients are
+  ignored). Mount or upload at runtime only.
+- **Network:** the app binds localhost by default. Expose via reverse proxy /
+  VPN with TLS; never publish PHI-capable uploads to the open internet.
+- **Privacy:** DICOM uploads are anonymized in-memory temp dirs
+  (`anon_*`, auto-purged). Per-run outputs live under `brats_out_*` and are
+  purged after `ARTIFACT_RETENTION_HOURS` (default 24h; set `0` for
+  immediate deletion — note Gradio serves downloads from the workdir, so `0`
+  removes download links after the run).
+- **Research use only** — not a medical device; see LICENSE disclaimer.
+
+## Repository Structure (production layout)
 
 ```text
 .
 |-- app.py                         Gradio application and visualisation workflow
+|-- Dockerfile                     Production container (code only; weights mounted)
+|-- .dockerignore
+|-- .env.example                   Server, pipeline and retention settings
+|-- LICENSE                        MIT + medical research-use disclaimer
 |-- requirements.txt               Runtime and development dependencies
-|-- artifacts/
-|   |-- best_unet.pt               PyTorch state_dict checkpoint
-|   |-- best_unet.onnx             ONNX model
-|   |-- best_unet.onnx.data        External ONNX weights
-|   |-- unet3d.onnx                Additional ONNX export
-|   `-- unet3d.onnx.data            External ONNX weights
+|-- artifacts/                     MODEL WEIGHTS (git-ignored, mount at deploy)
 |-- src/
-|   |-- dicom_loader.py             NIfTI/DICOM ingestion and validation
-|   |-- preprocessing.py            Phase 1 dataset and preprocessing helpers
-|   |-- model.py                    3D U-Net architecture and checkpoint loading
-|   |-- inference.py                ONNX/PyTorch inference and evaluation metrics
-|   |-- export_onnx.py              PyTorch checkpoint to ONNX export utility
-|   `-- verify_onnx.py              PyTorch/ONNX equivalence command
+|   |-- anonymize.py               DICOM PHI anonymization for uploads
+|   |-- bratsify.py                Hospital→BraTS standardization (N4+register+canvas)
+|   |-- dicom_loader.py            NIfTI/DICOM ingestion and validation
+|   |-- export_onnx.py             Checkpoint → ONNX export (placeholder-guarded)
+|   |-- inference.py               ONNX Runtime engine + Dice/HD evaluation
+|   |-- io_unified.py              Unified DICOM+NIfTI entry point
+|   |-- mesh_export.py             STL/GLB + NIfTI-seg exports
+|   |-- model.py                   3D U-Net architecture and checkpoint loading
+|   |-- partial_analysis.py        T1+T2-only fallback (asymmetry heat + estimate)
+|   |-- postprocess.py             Cleanup + RANO diameters + normal-scan flag
+|   |-- preprocessing.py           Phase 1 dataset and preprocessing helpers
+|   |-- report.py                  Printable HTML surgical report
+|   `-- verify_onnx.py             PyTorch↔ONNX equivalence check
+|-- scripts/
+|   |-- make_synth_dicom_patient.py  Test-only 4-series DICOM generator
+|   `-- ui_smoke_test.py             HTTP round-trip test vs running server
 |-- tests/
-|   `-- test_dicom_loader.py         Ingestion and preprocessing smoke tests
-|-- sample_brats_patient/            Small sample NIfTI/DICOM-style patient inputs
-|-- braintumour-phase-1.ipynb        Phase 1 model and preprocessing notebook
+|   |-- test_app_volumetry.py      Per-class cm3 regression + warnings
+|   |-- test_bratsify.py           BraTS-ifier unit + real-data e2e
+|   |-- test_dicom_loader.py       Ingestion engine tests
+|   |-- test_partial.py            Partial-DICOM fallback tests
+|   `-- test_unified.py            Unified DICOM+NIfTI tests
+|-- sample_brats_patient/          Small sample inputs (git-ignored for PHI safety)
+|-- braintumour-phase-1.ipynb      Phase 1 model and preprocessing notebook
 `-- previous/braintumour-phase-0.ipynb
 ```
 
@@ -150,7 +196,7 @@ python -m src.export_onnx \
 
 The export uses a sample input shape of `(1, 4, 128, 128, 128)`, keeps the channel count fixed at four, and marks batch and spatial dimensions as dynamic. The script validates the resulting ONNX graph with `onnx.checker`.
 
-If the checkpoint path does not exist, the export utility creates a randomly initialized checkpoint so that the technical pipeline can run end to end. Those dummy weights are not a trained clinical model and must be replaced with the intended trained checkpoint for meaningful predictions.
+If the checkpoint path does not exist, the export utility creates a randomly initialized checkpoint so that the technical pipeline can run end to end. Those dummy weights are not a trained clinical model and must be replaced with the intended trained checkpoint for meaningful predictions. Placeholder exports are flagged with a `<artifact>.PLACEHOLDER` marker file, and `app.py` surfaces a visible model-health warning (in the metrics panel and warning log) whenever it detects placeholder weights — either via that marker or a prediction that labels every voxel as tumour — so untrained output is never reported silently.
 
 ## Verify PyTorch and ONNX Outputs
 
@@ -200,12 +246,27 @@ Hospital hardening on top of `load_patient_scans()`:
   installed, `segmentation.nii.gz` in reference space, printable **HTML report**
   with MPR snapshots + volumetry + RANO + provenance.
 
+## Phase A ("BraTS-ifier"): Hospital Scan Standardization
+
+Real-world hospital scans frequently arrive with heterogeneous geometry, anisotropic voxel spacing, arbitrary fields of view, scanner bias fields, and inter-modality misalignment. Phase A (`src/bratsify.py`) introduces a clinical-grade standardization pipeline:
+
+- **1 mm Isotropic Resampling**: World-space affine-aware resample with physical volume extent preservation.
+- **Gradient-NCC Multi-Resolution Alignment**: Sub-sampling edge correlation pyramid with center-of-mass search seed, evaluation voxel budgeting, and candidate re-ranking against full-resolution gradient maps. Fixes coarse-level local minima traps.
+- **Affine Guardrails**: `min_ncc_gain` threshold (0.02) and COM offset check prevent disturbing already co-registered modalities.
+- **SimpleITK N4 Bias Correction**: Automated RF coil inhomogeneity correction with conservative in-mask p1/p99 guards (`[0.40, 2.50]`) and runaway mean scaling protection (`[0.25, 4.0]`).
+- **BraTS Canvas Placement**: Safe `(240, 240, 155)` centering using grow-only bounding logic that never crops anatomy.
+- **QA & Provenance**: Auto-generates three-plane multi-modality QA snapshot PNG (`bratsify_qa.png`) and comprehensive JSON provenance (`bratsify_provenance.json`).
+
+Controlled via `BRATSIFY=1` (enabled by default in `app.py`) or via `load_unified(..., bratsify=True)` in Python code.
+
+
 ```bash
 PYTHONPATH=. .venv/bin/python tests/test_unified.py
 PYTHONPATH=. .venv/bin/python tests/test_dicom_loader.py
+PYTHONPATH=. .venv/bin/python tests/test_app_volumetry.py
 ```
 
-The current tests cover NIfTI dictionary/list ingestion, preprocessing output shape and metadata, synthetic DICOM ingestion, missing modalities, shape mismatch, orientation mismatch, and invalid input types.
+The current tests cover NIfTI dictionary/list ingestion, preprocessing output shape and metadata, synthetic DICOM ingestion, missing modalities, shape mismatch, orientation mismatch, invalid input types, per-class volumetric accuracy (exact cm^3 for a known BraTS case), native label-4 remapping, enhancing-tumour overlay rendering, and placeholder-model health warnings.
 
 ## Test DICOM data (1 patient, synthetic-from-BraTS, test-only)
 
@@ -261,4 +322,6 @@ The Phase 1 preprocessing functions load the four modalities and segmentation, r
 
 ## License
 
-No license file is currently included in the repository.
+MIT — see [LICENSE](LICENSE). Includes a medical research-use disclaimer:
+research visualization only, not a medical device; all outputs require
+radiologist verification.

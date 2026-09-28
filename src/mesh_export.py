@@ -27,10 +27,14 @@ LABEL_INFO = {
 
 def meshes_from_segmentation(seg: np.ndarray, step_size: int = 1,
                              spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)):
-    """Marching-cubes meshes per label: {label: (verts_mm, faces)}."""
+    """Marching-cubes meshes per label: {label: (verts_mm, faces)}.
+
+    Native BraTS label 4 (enhancing) is merged into label 3 so raw
+    sidecars export an enhancing mesh instead of silently dropping it.
+    """
     out: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for label in (1, 2, 3):
-        mask = (seg == label)
+        mask = np.isin(seg, (label, 4)) if label == 3 else (seg == label)
         if not mask.any():
             continue
         try:

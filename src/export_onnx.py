@@ -36,20 +36,41 @@ DYNAMIC_AXES = {
 }
 
 
-def _ensure_checkpoint(checkpoint_path: str, seed: int = 42) -> None:
+def _placeholder_marker_path(path: str) -> str:
+    return path + ".PLACEHOLDER"
+
+
+def _ensure_checkpoint(checkpoint_path: str, seed: int = 42) -> bool:
     """Create a dummy checkpoint if the real one is missing.
 
     The dummy weights are randomly initialized but identical across both
     PyTorch and ONNX Runtime, so numerical equivalence checks remain valid.
+
+    Returns ``True`` when the checkpoint is a placeholder (either created
+    now or previously without a trained replacement), and writes a
+    ``<path>.PLACEHOLDER`` marker so the app can warn users that the
+    model output is not clinically meaningful.
     """
+    marker = _placeholder_marker_path(checkpoint_path)
     if os.path.exists(checkpoint_path):
-        return
+        # A pre-existing checkpoint without a marker is assumed trained;
+        # a marker left behind means it was never replaced by real weights.
+        return os.path.exists(marker)
 
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
     torch.manual_seed(seed)
     model = UNet3D(in_channels=4, out_channels=4)
     torch.save(model.state_dict(), checkpoint_path)
-    print(f"[export] Checkpoint not found; saved dummy state_dict -> {checkpoint_path}")
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(
+            "Placeholder checkpoint created by src.export_onnx._ensure_checkpoint\n"
+            f"seed={seed} — NOT trained. Volumes/predictions from this model are\n"
+            "not clinically meaningful. Replace with a trained checkpoint,\n"
+            "re-run `python -m src.export_onnx`, then delete this marker file.\n"
+        )
+    print(f"[export][WARNING] Checkpoint not found; saved UNTRAINED dummy "
+          f"state_dict -> {checkpoint_path} (marker: {marker})")
+    return True
 
 
 def export_to_onnx(
@@ -74,7 +95,7 @@ def export_to_onnx(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    _ensure_checkpoint(checkpoint_path)
+    is_placeholder = _ensure_checkpoint(checkpoint_path)
 
     model = UNet3D(in_channels=4, out_channels=4)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -99,6 +120,21 @@ def export_to_onnx(
     # Validate the exported graph.
     onnx_model = onnx.load(output_path)
     onnx.checker.check_model(onnx_model)
+
+    # Mirror the placeholder marker onto the ONNX artifact so runtime
+    # consumers (app.py) can warn about untrained weights.
+    onnx_marker = _placeholder_marker_path(output_path)
+    if is_placeholder:
+        with open(onnx_marker, "w", encoding="utf-8") as fh:
+            fh.write(
+                "Placeholder ONNX export from an UNTRAINED checkpoint.\n"
+                "Predictions are not clinically meaningful. Replace the\n"
+                "checkpoint with trained weights and re-run export.\n"
+            )
+        print(f"[export][WARNING] Placeholder weights exported; marker -> "
+              f"{onnx_marker}")
+    elif os.path.exists(onnx_marker):
+        os.remove(onnx_marker)
 
     print(f"[export] ONNX model saved -> {output_path}")
     print(f"[export] Opset: {opset_version} | Device: {device}")

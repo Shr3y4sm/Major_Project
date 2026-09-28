@@ -23,3 +23,12 @@ matplotlib>=3.7.0  # MPR PNG snapshots for the HTML surgical report
 
 # Optional surgical exports (gracefully skipped if absent)
 # trimesh>=4.0.0  # enables combined GLB export alongside STL
+# BraTS-ifier N4 bias-field correction (gracefully skipped if absent)
+SimpleITK>=2.3.0
+
+# UI smoke test (HTTP round-trip against a running server)
+gradio_client>=2.0.0
+
+# Dev / CI
+pytest>=8.0.0
+ruff>=0.4.0

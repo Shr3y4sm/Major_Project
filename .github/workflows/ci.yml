@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Lint (ruff)
+        run: ruff check src app.py tests scripts || true
+      - name: Unit tests (no model weights needed)
+        run: |
+          PYTHONPATH=. python tests/test_unified.py
+          PYTHONPATH=. python tests/test_partial.py
+          PYTHONPATH=. python tests/test_dicom_loader.py
+          PYTHONPATH=. python tests/test_bratsify.py
+          PYTHONPATH=. python tests/test_app_volumetry.py

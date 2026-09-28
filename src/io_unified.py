@@ -230,8 +230,20 @@ def build_ingestion_report(warnings: Sequence[str]) -> str:
 
 
 def load_unified(input_source, harmonize: bool = True,
-                 ras_canonical: bool = True, reference: str = "t1ce"):
-    """One entry point for BOTH NIfTI and DICOM (dir / ZIP / dict / list)."""
+                 ras_canonical: bool = True, reference: str = "t1ce",
+                 bratsify: bool = False,
+                 bratsify_cfg: Optional[Any] = None):
+    """One entry point for BOTH NIfTI and DICOM (dir / ZIP / dict / list).
+
+    When ``bratsify=True`` is passed, Phase A preprocessing
+    (:func:`src.bratsify.bratsify_scans`) is applied after canonicalization.
+    This supersedes shape-ratio harmonization with affine-aware resampling,
+    1 mm isotropic target spacing, gradient-NCC rigid co-registration,
+    optional SimpleITK N4 bias correction, and centering in the BraTS canvas.
+    When ``bratsify=True``, the function returns ``(scans, warnings, bratsify_report)``.
+    When ``bratsify=False`` (default for backwards compatibility), it returns
+    ``(scans, warnings)``.
+    """
     import shutil as _sh
     from src.dicom_loader import IngestionError
 
@@ -283,6 +295,13 @@ def load_unified(input_source, harmonize: bool = True,
                 warnings.extend(w)
             except Exception as exc:
                 warnings.append(f"RAS canonicalization skipped: {exc}")
+        if bratsify:
+            from src.bratsify import bratsify_scans, BratsifyConfig, BratsifyReport
+            cfg = bratsify_cfg if bratsify_cfg is not None else BratsifyConfig()
+            scans, b_report = bratsify_scans(scans, cfg=cfg, reference=reference)
+            warnings.extend(b_report.warnings)
+            return scans, warnings, b_report
+
         if harmonize:
             try:
                 scans, w = harmonize_shapes(scans, reference=reference)

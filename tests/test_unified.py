@@ -78,10 +78,40 @@ def test_stl_and_cleanup_and_rano_and_flag():
     assert tumor_flag({"Total Whole Tumor": 5.0}) == ""
 
 
+def test_load_unified_bratsify_pipeline_and_qa():
+    """Verify load_unified with bratsify=True returns (scans, warns, report) and generates QA."""
+    from src.io_unified import load_unified
+    from src.bratsify import BratsifyConfig
+
+    paths = {
+        "t1": "sample_brats_patient/BraTS2020/BraTS20_Training_001_t1.nii",
+        "t1ce": "sample_brats_patient/BraTS2020/BraTS20_Training_001_t1ce.nii",
+        "t2": "sample_brats_patient/BraTS2020/BraTS20_Training_001_t2.nii",
+        "flair": "sample_brats_patient/BraTS2020/BraTS20_Training_001_flair.nii",
+    }
+    if not all(os.path.exists(p) for p in paths.values()):
+        print("SKIP: test_load_unified_bratsify_pipeline_and_qa (missing sample files)")
+        return
+
+    with tempfile.TemporaryDirectory() as d:
+        qa_path = os.path.join(d, "qa.png")
+        cfg = BratsifyConfig(n4=False, qa_path=qa_path, qa_modality="t2")
+        result = load_unified(paths, bratsify=True, bratsify_cfg=cfg)
+        assert isinstance(result, tuple) and len(result) == 3, f"Expected 3-tuple, got {type(result)}"
+        scans, warns, report = result
+        assert report is not None
+        assert report.applied is True
+        assert report.final_shape == (240, 240, 155)
+        assert os.path.isfile(qa_path)
+        assert os.path.getsize(qa_path) > 1000
+    print("PASS: test_load_unified_bratsify_pipeline_and_qa")
+
+
 if __name__ == "__main__":
     test_hospital_tokens()
     test_folder_discovery_and_seg_skip()
     test_nested_dotnii_dirs()
     test_real_brats_folder_layout()
     test_stl_and_cleanup_and_rano_and_flag()
+    test_load_unified_bratsify_pipeline_and_qa()
     print("unified tests PASSED")
