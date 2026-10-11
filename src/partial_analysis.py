@@ -27,7 +27,7 @@ __all__ = [
     "PROTOCOL_CHECKLIST_MD",
 ]
 
-PROTOCOL_CHECKLIST_MD = """### 🏥 Ask PACS for (tumor protocol)
+PROTOCOL_CHECKLIST_MD = """### Request from PACS (tumour protocol)
 - AX T1 (pre-contrast, 3D or 5mm axial)
 - AX T1C / T1-GAD post-contrast (same geometry as T1)
 - AX T2 / T2W (axial)

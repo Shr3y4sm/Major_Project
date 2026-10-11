@@ -240,7 +240,7 @@ def _build_metrics_markdown(volumes: dict[str, float],
                             model_warning: str = "") -> str:
     """Render the volumetric metrics as a clinical Markdown summary."""
     lines = [
-        "### 📊 Quantitative Volumetric Analysis",
+        "### Volumetric analysis",
         "",
         "| Structure | Volume (cm³) |",
         "|-----------|-------------:|",
@@ -254,13 +254,13 @@ def _build_metrics_markdown(volumes: dict[str, float],
         "physical space. Whole Tumor = Necrotic + Edema + Enhancing."
     )
     if source:
-        lines += ["", f"> 📂 Segmentation source: **{source}**"]
+        lines += ["", f"> Segmentation source: **{source}**"]
     if model_warning:
         lines += ["", "> " + model_warning]
     if flag:
-        lines += ["", "> ⚠️ " + flag]
+        lines += ["", "> " + flag]
     lines += ["",
-              "> 🧪 Research visualization only — not for diagnosis. "
+              "> Research visualization only — not for diagnosis. "
               "Requires radiologist verification."]
     return "\n".join(lines)
 
@@ -368,7 +368,7 @@ def _model_health_warning(pred_128: np.ndarray) -> str:
     if not reasons:
         return ""
     return (
-        "🚨 Model health: " + "; ".join(reasons) +
+        "Model health: " + "; ".join(reasons) +
         ". Treat displayed metrics accordingly."
     )
 
@@ -652,7 +652,7 @@ def _partial_estimate_markdown(est: dict, heat_max: float,
                                found: list[str]) -> str:
     """Render the ellipsoid-estimate panel with honesty guardrails."""
     lines = [
-        "### 📐 Geometric Estimate (partial data — NOT AI segmentation)",
+        "### Geometric estimate (partial data — not AI segmentation)",
         "",
         f"Source series: {found}. Heat max: {heat_max:.3f}.",
         "",
@@ -677,7 +677,7 @@ def _partial_estimate_markdown(est: dict, heat_max: float,
             "> " + str(est.get("note", "")),
         ]
     lines += ["",
-              "> ⚠️ Enhancing tumor needs T1ce; edema needs FLAIR. "
+              "> Enhancing tumor needs T1ce; edema needs FLAIR. "
               "This estimate cannot replace a 4-modality segmentation."]
     return "\n".join(lines)
 
@@ -874,12 +874,12 @@ def _run_pipeline(input_source: str | dict,
     if b_report:
         warn_md = b_report.to_markdown()
     else:
-        warn_md = ("### ℹ️ Ingestion\n\n" + build_ingestion_report(warnings)
+        warn_md = ("### Ingestion\n\n" + build_ingestion_report(warnings)
                    if warnings else "")
     if model_warning:
         warn_md += ("\n\n" if warn_md else "") + "> " + model_warning
     if flag:
-        warn_md += ("\n\n" if warn_md else "") + "> ⚠️ " + flag
+        warn_md += ("\n\n" if warn_md else "") + "> " + flag
     downloads = stl_list + ([glb_path] if glb_path else []) + [nifti_path] + extra_downloads
     _maybe_cleanup_workdir(workdir)
     return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
@@ -1041,7 +1041,7 @@ def run_analysis(
                 metrics_md = (_partial_estimate_markdown(
                     est, float(heat.max()) if heat is not None else 0.0,
                     found) if est is not None else "")
-                warn_md = ("### 🩻 Partial-DICOM Analysis (T2 signal, honest)\n\n"
+                warn_md = ("### Partial-scan analysis (T2 signal, non-diagnostic)\n\n"
                            f"Found series: {found}. "
                            f"Missing for tumor segmentation: {missing}.\n\n"
                            + (("\n".join(f"- {n}" for n in notes) + "\n\n")
@@ -1056,16 +1056,16 @@ def run_analysis(
                            + "*(Note: the sample `DICOM.zip` is a normal brain scan from Zenodo 16956 — "
                            "neither tumor nor volume is expected.)*\n\n"
                            + PROTOCOL_CHECKLIST_MD)
-                error_md = (f"### ⚠️ Ingestion Error\n\n{exc}\n\n"
+                error_md = (f"### Ingestion note\n\n{exc}\n\n"
                             "Showing partial-data analysis above "
                             "(anatomy + asymmetry heat + geometric estimate).")
                 return plot_3d, plot_mpr, metrics_md, \
                     warn_md + "\n\n" + error_md, None, None
-        error_md = f"### ⚠️ Ingestion Error\n\n{exc}"
+        error_md = f"### Ingestion note\n\n{exc}"
     except FileNotFoundError as exc:
-        error_md = f"### ⚠️ Model / File Error\n\n{exc}"
+        error_md = f"### Model / file note\n\n{exc}"
     except Exception as exc:  # noqa: BLE001 - surface all runtime errors in UI
-        error_md = f"### ⚠️ Processing Error\n\n{exc}"
+        error_md = f"### Processing note\n\n{exc}"
 
     # Return empty placeholders on error.
     empty_fig = go.Figure()
@@ -1076,95 +1076,190 @@ def run_analysis(
     return empty_fig, empty_fig, "", error_md, None, None
 
 
+# Apple-minimal UI theme (UI-only: component variable names are unchanged so
+# all .change()/.click() bindings keep working.)
+_APPLE_FONT_STACK = (
+    "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', "
+    "Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+)
+
+_APPLE_THEME = gr.themes.Base(
+    primary_hue="blue",
+    secondary_hue="slate",
+    neutral_hue="slate",
+    font=_APPLE_FONT_STACK,
+    font_mono="ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+).set(
+    body_background_fill="#F5F5F7",
+    body_background_fill_dark="#000000",
+    body_text_color="#1D1D1F",
+    body_text_color_dark="#F5F5F7",
+    body_text_color_subdued="#86868B",
+    background_fill_primary="#FFFFFF",
+    background_fill_primary_dark="#1D1D1F",
+    background_fill_secondary="#F5F5F7",
+    background_fill_secondary_dark="#2C2C2E",
+    border_color_primary="#E5E5EA",
+    border_color_primary_dark="#38383A",
+    color_accent_soft="#E8F1FD",
+    color_accent_soft_dark="#0A2A4A",
+    button_primary_background_fill="#0071E3",
+    button_primary_background_fill_hover="#0077ED",
+    button_primary_background_fill_dark="#0A84FF",
+    button_primary_background_fill_hover_dark="#409CFF",
+    button_primary_text_color="#FFFFFF",
+    button_primary_text_color_dark="#FFFFFF",
+    button_primary_border_color="transparent",
+    button_secondary_background_fill="#FFFFFF",
+    button_secondary_background_fill_hover="#F5F5F7",
+    button_secondary_background_fill_dark="#1D1D1F",
+    button_secondary_background_fill_hover_dark="#2C2C2E",
+    button_secondary_border_color="#D2D2D7",
+    button_secondary_border_color_dark="#48484A",
+    button_secondary_text_color="#1D1D1F",
+    button_secondary_text_color_dark="#F5F5F7",
+    block_radius="16px",
+    block_title_text_size="15px",
+    block_label_text_size="12px",
+    block_label_text_weight="600",
+    input_background_fill="#FFFFFF",
+    input_background_fill_dark="#1D1D1F",
+    input_border_color="#D2D2D7",
+    input_border_color_dark="#48484A",
+    slider_color="#0071E3",
+    slider_color_dark="#0A84FF",
+    checkbox_background_color_selected="#0071E3",
+    checkbox_background_color_selected_dark="#0A84FF",
+)
+
+_APPLE_CSS = """
+.gradio-container { max-width: 1240px !important; margin: 0 auto; }
+main { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+.ntt-hero { padding: 28px 4px 6px; }
+.ntt-hero h1 { font-size: 30px !important; font-weight: 700 !important; letter-spacing: -0.02em; margin: 0 0 4px !important; border: none !important; padding: 0 !important; }
+.ntt-hero h1 .ntt-dot { color: #0071E3; }
+.ntt-hero p { font-size: 15px; color: #6E6E73; margin: 0 0 10px; }
+.ntt-version { display: inline-block; font-size: 12px; font-weight: 600; color: #0071E3; background: #E8F1FD; border-radius: 999px; padding: 3px 12px; letter-spacing: 0.01em; }
+.ntt-disclaimer { font-size: 12px; color: #86868B; margin-top: 12px; padding: 8px 12px; background: #FFFFFF; border: 1px solid #E5E5EA; border-radius: 12px; }
+.ntt-disclaimer strong { color: #515154; font-weight: 600; }
+.ntt-section { font-size: 12px !important; font-weight: 700 !important; letter-spacing: 0.08em; text-transform: uppercase; color: #86868B !important; margin: 18px 0 8px !important; }
+#ntt-run { border-radius: 999px !important; font-size: 16px !important; font-weight: 600 !important; padding: 12px 24px !important; margin-top: 8px; transition: filter 0.15s ease, transform 0.15s ease; }
+#ntt-run:hover { filter: brightness(1.07); transform: translateY(-1px); }
+#ntt-mode .wrap { background: #E9E9EE; border-radius: 999px; padding: 3px; gap: 2px; }
+#ntt-mode label { border-radius: 999px !important; border: none !important; font-weight: 600 !important; font-size: 13px !important; }
+#ntt-mode label.selected { background: #FFFFFF !important; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+.ntt-uploads label span { font-size: 13px !important; }
+.ntt-side .accordion-header, .accordion-header { font-size: 13px !important; font-weight: 600 !important; }
+#ntt-results .tabs { border: none !important; }
+#ntt-results .tab-nav { background: transparent !important; border-bottom: 1px solid #E5E5EA; gap: 4px; }
+#ntt-results .tab-nav button { font-size: 14px !important; font-weight: 600 !important; color: #86868B; border-radius: 8px 8px 0 0; }
+#ntt-results .tab-nav button.selected { color: #0071E3 !important; box-shadow: inset 0 -2px 0 #0071E3; }
+#ntt-metrics table { font-size: 14px !important; }
+#ntt-metrics table th { font-weight: 600 !important; }
+#ntt-results .plot { border: 1px solid #E5E5EA; border-radius: 16px; overflow: hidden; background: #FFFFFF; }
+@media (prefers-color-scheme: dark) {
+  .ntt-hero p { color: #A1A1A6; }
+  .ntt-version { background: #0A2A4A; color: #409CFF; }
+  .ntt-disclaimer { background: #1D1D1F; border-color: #38383A; color: #A1A1A6; }
+  .ntt-disclaimer strong { color: #D2D2D7; }
+  .ntt-section { color: #98989D !important; }
+  #ntt-mode .wrap { background: #2C2C2E; }
+  #ntt-mode label.selected { background: #48484A !important; }
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Brain Tumour Segmentation") as demo:
-        gr.Markdown(
+    with gr.Blocks(title="Brain Tumour Segmentation", theme=_APPLE_THEME,
+                   css=_APPLE_CSS) as demo:
+        gr.HTML(
             f"""
-            # 🧠 Brain Tumour Segmentation — Clinical Workflow
-            **Multi-modal MRI (T1, T1ce, T2, FLAIR) → 3D UNet → Volumetric Analysis**
-
-            **A (Radiology):** MPR viewer with overlay opacity + background
-            choice + volumetry. **B (Surgery):** in-situ 3D + STL/GLB export
-            + printable report. Accepts **NIfTI x4 / folder / ZIP** and
-            **DICOM folder / ZIP**.
-
-            > ⚠️ **Research visualization only (v{APP_VERSION}) — NOT a medical
-            > device.** Outputs require radiologist verification; not for
-            > diagnosis, treatment, or surgical navigation.
+            <div class="ntt-hero">
+              <h1>Brain Tumour Segmentation<span class="ntt-dot">.</span></h1>
+              <p>Multi-modal MRI &rarr; 3D U-Net &rarr; volumetry, 3D surface and surgical exports.</p>
+              <span class="ntt-version">Research preview &middot; v{APP_VERSION}</span>
+              <div class="ntt-disclaimer"><strong>Research visualization only &mdash; not a medical device.</strong>
+              Outputs require radiologist verification; not for diagnosis, treatment, or surgical navigation.</div>
+            </div>
             """
         )
 
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["ntt-side"]):
+                gr.Markdown('<p class="ntt-section">1 &middot; Input</p>')
                 mode = gr.Radio(
                     choices=["NIfTI Files", "DICOM ZIP"],
                     value="NIfTI Files",
-                    label="Input Mode (DICOM + NIfTI compatible)",
+                    label="Source",
+                    elem_id="ntt-mode",
                 )
 
-                with gr.Group(visible=True) as nifti_group:
-                    t1_file = gr.File(label="T1 (NIfTI)", file_types=[".nii", ".nii.gz"])
-                    t1ce_file = gr.File(label="T1ce (NIfTI)", file_types=[".nii", ".nii.gz"])
-                    t2_file = gr.File(label="T2 (NIfTI)", file_types=[".nii", ".nii.gz"])
-                    flair_file = gr.File(label="FLAIR (NIfTI)", file_types=[".nii", ".nii.gz"])
+                with gr.Group(visible=True, elem_classes=["ntt-uploads"]) as nifti_group:
+                    t1_file = gr.File(label="T1", file_types=[".nii", ".nii.gz"])
+                    t1ce_file = gr.File(label="T1ce — post-contrast", file_types=[".nii", ".nii.gz"])
+                    t2_file = gr.File(label="T2", file_types=[".nii", ".nii.gz"])
+                    flair_file = gr.File(label="FLAIR", file_types=[".nii", ".nii.gz"])
                     nifti_folder = gr.File(
-                        label="…or NIfTI folder/ZIP bundle (optional override)",
+                        label="Folder or ZIP bundle (optional)",
                         file_types=[".zip"])
 
-                with gr.Group(visible=False) as zip_group:
-                    zip_file = gr.File(label="DICOM ZIP / folder export (.zip)",
+                with gr.Group(visible=False, elem_classes=["ntt-uploads"]) as zip_group:
+                    zip_file = gr.File(label="DICOM ZIP",
                                        file_types=[".zip"])
                     anonymize = gr.Checkbox(
                         value=True,
-                        label="Anonymize DICOM on upload (strip PHI, keep geometry)")
+                        label="Anonymize on upload (strip PHI, keep geometry)")
 
-                run_btn = gr.Button("▶ Run Analysis", variant="primary")
+                gr.Markdown('<p class="ntt-section">2 &middot; Configure</p>')
+                run_btn = gr.Button("Run Analysis", variant="primary",
+                                    elem_id="ntt-run")
 
-                with gr.Accordion("A — MPR Slice Controls", open=True):
-                    axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial Slice")
-                    sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal Slice")
-                    coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal Slice")
+                with gr.Accordion("Slice controls", open=False):
+                    axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial slice")
+                    sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal slice")
+                    coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal slice")
                     bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR",
-                                           label="MPR background")
+                                           label="Background")
                     overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05,
                                                 label="Overlay opacity")
 
-                with gr.Accordion("A+B — Classes + Cleanup", open=True):
+                with gr.Accordion("Classes and cleanup", open=False):
                     show_classes = gr.CheckboxGroup(
                         [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2),
                          (CLASS_NAMES[3], 3)],
-                        value=[1, 2, 3], label="Show classes (3D + MPR)")
+                        value=[1, 2, 3], label="Visible classes")
                     cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
                                                 label="Remove blobs smaller than (voxels)")
 
-                with gr.Accordion("🩻 Partial-DICOM Aids (T1+T2-only scans)",
-                                   open=True):
+                with gr.Accordion("Partial-scan aids",
+                                   open=False):
                     show_heat = gr.Checkbox(
                         value=True,
-                        label="Show T2 asymmetry heat (NON-SPECIFIC — not tumor)")
+                        label="Show asymmetry heat (non-specific)")
                     heat_percentile = gr.Slider(90.0, 99.9, value=98.0,
                                                 step=0.1,
                                                 label="Heat threshold percentile")
                     gr.Markdown(PROTOCOL_CHECKLIST_MD)
 
-            with gr.Column(scale=3):
-                error_md = gr.Markdown("")
-                metrics_md = gr.Markdown("")
+            with gr.Column(scale=3, elem_id="ntt-results"):
+                gr.Markdown('<p class="ntt-section">3 &middot; Results</p>')
+                error_md = gr.Markdown("", elem_classes=["ntt-alert"])
+                metrics_md = gr.Markdown("", elem_id="ntt-metrics")
 
                 with gr.Tabs():
-                    with gr.Tab("3D Surface (B — surgical)"):
-                        plot_3d = gr.Plot(label="3D Tumour Surface")
-                    with gr.Tab("MPR 2D Viewer (A — radiology)"):
-                        plot_mpr = gr.Plot(label="Multi-Planar Reconstruction")
+                    with gr.Tab("3D Surface"):
+                        plot_3d = gr.Plot(label="3D tumour surface")
+                    with gr.Tab("MPR Viewer"):
+                        plot_mpr = gr.Plot(label="Multi-planar reconstruction")
 
-                with gr.Accordion("B — Exports (STL/GLB + NIfTI-seg + report)", open=False):
-                    report_html = gr.File(label="Surgical / radiology report (HTML)")
-                    downloads = gr.Files(label="Meshes + segmentation downloads")
+                with gr.Accordion("Exports", open=False):
+                    report_html = gr.File(label="Report (HTML)")
+                    downloads = gr.Files(label="Meshes and segmentation")
 
         # Toggle input groups based on mode.
         def _toggle_mode(selected: str) -> tuple[dict, dict]:
@@ -1206,5 +1301,4 @@ if __name__ == "__main__":
     app.launch(
         server_name=host,
         server_port=port,
-        theme=gr.themes.Soft(),
     )
