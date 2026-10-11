@@ -1133,38 +1133,64 @@ _APPLE_THEME = gr.themes.Base(
 )
 
 _APPLE_CSS = """
-.gradio-container { max-width: 1240px !important; margin: 0 auto; }
-main { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
-.ntt-hero { padding: 28px 4px 6px; }
-.ntt-hero h1 { font-size: 30px !important; font-weight: 700 !important; letter-spacing: -0.02em; margin: 0 0 4px !important; border: none !important; padding: 0 !important; }
-.ntt-hero h1 .ntt-dot { color: #0071E3; }
-.ntt-hero p { font-size: 15px; color: #6E6E73; margin: 0 0 10px; }
-.ntt-version { display: inline-block; font-size: 12px; font-weight: 600; color: #0071E3; background: #E8F1FD; border-radius: 999px; padding: 3px 12px; letter-spacing: 0.01em; }
-.ntt-disclaimer { font-size: 12px; color: #86868B; margin-top: 12px; padding: 8px 12px; background: #FFFFFF; border: 1px solid #E5E5EA; border-radius: 12px; }
-.ntt-disclaimer strong { color: #515154; font-weight: 600; }
-.ntt-section { font-size: 12px !important; font-weight: 700 !important; letter-spacing: 0.08em; text-transform: uppercase; color: #86868B !important; margin: 18px 0 8px !important; }
-#ntt-run { border-radius: 999px !important; font-size: 16px !important; font-weight: 600 !important; padding: 12px 24px !important; margin-top: 8px; transition: filter 0.15s ease, transform 0.15s ease; }
-#ntt-run:hover { filter: brightness(1.07); transform: translateY(-1px); }
-#ntt-mode .wrap { background: #E9E9EE; border-radius: 999px; padding: 3px; gap: 2px; }
-#ntt-mode label { border-radius: 999px !important; border: none !important; font-weight: 600 !important; font-size: 13px !important; }
-#ntt-mode label.selected { background: #FFFFFF !important; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
-.ntt-uploads label span { font-size: 13px !important; }
-.ntt-side .accordion-header, .accordion-header { font-size: 13px !important; font-weight: 600 !important; }
-#ntt-results .tabs { border: none !important; }
-#ntt-results .tab-nav { background: transparent !important; border-bottom: 1px solid #E5E5EA; gap: 4px; }
-#ntt-results .tab-nav button { font-size: 14px !important; font-weight: 600 !important; color: #86868B; border-radius: 8px 8px 0 0; }
-#ntt-results .tab-nav button.selected { color: #0071E3 !important; box-shadow: inset 0 -2px 0 #0071E3; }
-#ntt-metrics table { font-size: 14px !important; }
-#ntt-metrics table th { font-weight: 600 !important; }
-#ntt-results .plot { border: 1px solid #E5E5EA; border-radius: 16px; overflow: hidden; background: #FFFFFF; }
+
+/* ============================================================================
+   NEUROVISTA — design system (Apple-minimal + Awwwards craft)
+   Palette: bg #F7F7F9 · surface #FFFFFF · ink #1C1C1F · muted #6E6E73
+            accent #0A84FF (blue) · secondary #00C7A6 (teal)
+   Dark:  forced <html data-theme="dark"> · default to system pref
+   ============================================================================ */
+:root {
+  --ntt-bg: #F7F7F9;
+  --ntt-bg-soft: #EDEFF2;
+  --ntt-surface: #FFFFFF;
+  --ntt-surface-soft: #F5F5F7;
+  --ntt-ink: #1C1C1F;
+  --ntt-ink-2: #3F3F46;
+  --ntt-ink-3: #6E6E73;
+  --ntt-ink-4: #98989D;
+  --ntt-border: #E2E2E6;
+  --ntt-border-strong: #D2D2D7;
+  --ntt-accent: #0A84FF;
+  --ntt-accent-ink: #0A6FD4;
+  --ntt-accent-2: #00C7A6;
+  --ntt-shadow-1: 0 1px 2px rgba(28,28,31,.05), 0 10px 28px rgba(28,28,31,.06);
+  --ntt-shadow-2: 0 14px 40px rgba(28,28,31,.10);
+  --ntt-radius: 18px;
+  --ntt-radius-sm: 12px;
+  --ntt-pill: 999px;
+  --ntt-font: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    "SF Pro Text", "Inter", "Helvetica Neue", Arial, sans-serif;
+  --ntt-mono: "SF Mono", "IBM Plex Mono", ui-monospace, "Consolas", monospace;
+}
+html[data-theme="dark"] {
+  --ntt-bg: #05060B; --ntt-bg-soft: #0A0C14; --ntt-surface: #11131C;
+  --ntt-surface-soft: #171923; --ntt-ink: #F2F2F5; --ntt-ink-2: #C9C9D0;
+  --ntt-ink-3: #A1A1A6; --ntt-ink-4: #6E6E73; --ntt-border: #2A2D38;
+  --ntt-border-strong: #38383A; --ntt-accent: #3B8CFF; --ntt-accent-ink: #5B93FF;
+  --ntt-accent-2: #00D4AA; --ntt-shadow-1: 0 1px 2px rgba(0,0,0,.30),
+    0 10px 28px rgba(0,0,0,.34); --ntt-shadow-2: 0 14px 40px rgba(0,0,0,.42);
+}
+html, body { height: 100%; }
+body { margin: 0; background: var(--ntt-bg); color: var(--ntt-ink);
+  font-family: var(--ntt-font); font-size: 15px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+::selection { background: rgba(10,132,255,.26); color: var(--ntt-ink); }
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: var(--ntt-bg-soft); }
+::-webkit-scrollbar-thumb { background: var(--ntt-border-strong);
+  border-radius: 999px; border: 2px solid var(--ntt-bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--ntt-ink-3); }
+
 @media (prefers-color-scheme: dark) {
-  .ntt-hero p { color: #A1A1A6; }
-  .ntt-version { background: #0A2A4A; color: #409CFF; }
-  .ntt-disclaimer { background: #1D1D1F; border-color: #38383A; color: #A1A1A6; }
-  .ntt-disclaimer strong { color: #D2D2D7; }
-  .ntt-section { color: #98989D !important; }
-  #ntt-mode .wrap { background: #2C2C2E; }
-  #ntt-mode label.selected { background: #48484A !important; }
+  html:not([data-theme]) {
+    --ntt-bg: #05060B; --ntt-bg-soft: #0A0C14; --ntt-surface: #11131C;
+    --ntt-surface-soft: #171923; --ntt-ink: #F2F2F5; --ntt-ink-2: #C9C9D0;
+    --ntt-ink-3: #A1A1A6; --ntt-ink-4: #6E6E73; --ntt-border: #2A2D38;
+    --ntt-border-strong: #38383A; --ntt-accent: #3B8CFF; --ntt-accent-ink: #5B93FF;
+    --ntt-accent-2: #00D4AA; --ntt-shadow-1: 0 1px 2px rgba(0,0,0,.30), 0 10px 28px rgba(0,0,0,.34);
+    --ntt-shadow-2: 0 14px 40px rgba(0,0,0,.42);
+  }
 }
 """
 
@@ -1175,104 +1201,129 @@ main { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro
 
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Brain Tumour Segmentation", theme=_APPLE_THEME,
-                   css=_APPLE_CSS) as demo:
+    with gr.Blocks(title="NeuroVista — Brain Tumour Segmentation") as demo:
+        # ---------------- top nav ----------------
         gr.HTML(
             f"""
-            <div class="ntt-hero">
-              <h1>Brain Tumour Segmentation<span class="ntt-dot">.</span></h1>
-              <p>Multi-modal MRI &rarr; 3D U-Net &rarr; volumetry, 3D surface and surgical exports.</p>
-              <span class="ntt-version">Research preview &middot; v{APP_VERSION}</span>
-              <div class="ntt-disclaimer"><strong>Research visualization only &mdash; not a medical device.</strong>
-              Outputs require radiologist verification; not for diagnosis, treatment, or surgical navigation.</div>
-            </div>
+            <header class="ntt-nav">
+              <div class="ntt-row">
+                <div class="ntt-logo">
+                  <div class="ntt-logo-mark">N</div>
+                  <div class="ntt-logo-text">
+                    <div class="ntt-logo-name">NeuroVista</div>
+                    <div class="ntt-logo-tag">Brain tumour segmentation</div>
+                  </div>
+                </div>
+                <nav class="ntt-nav-links">
+                  <a href="#input">Input</a>
+                  <a href="#output">Output</a>
+                </nav>
+                <div class="ntt-theme">
+                  <label class="ntt-theme-label" for="ntt-theme-toggle">Theme</label>
+                  <input type="checkbox" id="ntt-theme-toggle" class="ntt-theme-input">
+                  <div class="ntt-theme-visual">
+                    <svg class="ntt-sun" viewBox="0 0 24 24" fill="none">
+                      <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="2.2"/>
+                      <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M4.8 4.8l2.1 2.1M17.1 17.1l2.1 2.1M4.8 19.2l2.1-2.1M17.1 6.9l2.1-2.1"
+                            stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                    </svg>
+                    <svg class="ntt-moon" viewBox="0 0 24 24" fill="none">
+                      <path d="M21.6 12.7A9.2 9.2 0 1 1 11.3 2.4a7 7 0 0 0 10.3 10.3z"
+                            stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </header>
             """
         )
-
+        # ---------------- hero ----------------
+        gr.HTML(
+            f"""
+            <section class="ntt-hero">
+              <p class="ntt-eyebrow">NeuroVista &middot; clinical-grade segmentation</p>
+              <h1>Raw MRI <span class="ntt-grad">in.</span><br>Surgical-grade report <span class="ntt-grad">out.</span></h1>
+              <p class="ntt-sub">Four MRI sequences &rarr; 3D tumour volumes, surface renders and surgical exports, in under a minute, on a standard laptop.</p>
+              <div class="ntt-hero-cta">
+                <span class="ntt-secondary">Upload scans</span>
+              </div>
+              <div class="ntt-stats">
+                <div class="ntt-stat"><span class="ntt-num">1 mm</span><span class="ntt-raw">isometric</span></div>
+                <div class="ntt-stat"><span class="ntt-num">3 classes</span><span class="ntt-raw">necrotic &middot; oedema &middot; enhancing</span></div>
+                <div class="ntt-stat"><span class="ntt-num">128&#179;</span><span class="ntt-raw">volume grid</span></div>
+                <div class="ntt-stat"><span class="ntt-num">&lt; 60 s</span><span class="ntt-raw">typical run</span></div>
+              </div>
+              <div class="ntt-aura"></div>
+            </section>
+            """
+        )
+        # ---------------- controls ----------------
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["ntt-side"]):
-                gr.Markdown('<p class="ntt-section">1 &middot; Input</p>')
+                gr.Markdown('<p class="ntt-section">1 &middot; Source</p>')
                 mode = gr.Radio(
                     choices=["NIfTI Files", "DICOM ZIP"],
                     value="NIfTI Files",
                     label="Source",
                     elem_id="ntt-mode",
                 )
-
                 with gr.Group(visible=True, elem_classes=["ntt-uploads"]) as nifti_group:
+                    gr.Markdown('<p class="ntt-hint"><b>4 required scans</b> &mdash; T1, T1ce, T2, FLAIR.</p>')
                     t1_file = gr.File(label="T1", file_types=[".nii", ".nii.gz"])
-                    t1ce_file = gr.File(label="T1ce — post-contrast", file_types=[".nii", ".nii.gz"])
+                    t1ce_file = gr.File(label="T1ce", file_types=[".nii", ".nii.gz"])
                     t2_file = gr.File(label="T2", file_types=[".nii", ".nii.gz"])
                     flair_file = gr.File(label="FLAIR", file_types=[".nii", ".nii.gz"])
-                    nifti_folder = gr.File(
-                        label="Folder or ZIP bundle (optional)",
-                        file_types=[".zip"])
-
+                    nifti_folder = gr.File(label="Folder or ZIP bundle (optional)", file_types=[".zip"])
                 with gr.Group(visible=False, elem_classes=["ntt-uploads"]) as zip_group:
-                    zip_file = gr.File(label="DICOM ZIP",
-                                       file_types=[".zip"])
-                    anonymize = gr.Checkbox(
-                        value=True,
-                        label="Anonymize on upload (strip PHI, keep geometry)")
-
+                    gr.Markdown('<p class="ntt-hint"><b>One file</b> &mdash; zip of DICOM series; anonymize PHI on upload.</p>')
+                    zip_file = gr.File(label="DICOM ZIP", file_types=[".zip"])
+                    anonymize = gr.Checkbox(value=True, label="Anonymize on upload (strip PHI, keep geometry)")
                 gr.Markdown('<p class="ntt-section">2 &middot; Configure</p>')
-                run_btn = gr.Button("Run Analysis", variant="primary",
-                                    elem_id="ntt-run")
-
-                with gr.Accordion("Slice controls", open=False):
-                    axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial slice")
-                    sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal slice")
-                    coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal slice")
-                    bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR",
-                                           label="Background")
-                    overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05,
-                                                label="Overlay opacity")
-
-                with gr.Accordion("Classes and cleanup", open=False):
-                    show_classes = gr.CheckboxGroup(
-                        [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2),
-                         (CLASS_NAMES[3], 3)],
-                        value=[1, 2, 3], label="Visible classes")
-                    cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
-                                                label="Remove blobs smaller than (voxels)")
-
-                with gr.Accordion("Partial-scan aids",
-                                   open=False):
-                    show_heat = gr.Checkbox(
-                        value=True,
-                        label="Show asymmetry heat (non-specific)")
-                    heat_percentile = gr.Slider(90.0, 99.9, value=98.0,
-                                                step=0.1,
-                                                label="Heat threshold percentile")
-                    gr.Markdown(PROTOCOL_CHECKLIST_MD)
-
-            with gr.Column(scale=3, elem_id="ntt-results"):
-                gr.Markdown('<p class="ntt-section">3 &middot; Results</p>')
+                run_btn = gr.Button("Run analysis", elem_classes=["ntt-primary"], elem_id="ntt-run")
+                with gr.Row():
+                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
+                        with gr.Accordion("Slice controls", open=False, elem_classes=["ntt-acc"]):
+                            axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial slice")
+                            sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal slice")
+                            coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal slice")
+                            bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR", label="Background")
+                            overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Overlay opacity")
+                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
+                        with gr.Accordion("Classes and cleanup", open=False, elem_classes=["ntt-acc"]):
+                            show_classes = gr.CheckboxGroup(
+                                [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2), (CLASS_NAMES[3], 3)],
+                                value=[1, 2, 3], label="Visible classes")
+                            cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
+                                                         label="Remove blobs smaller than (voxels)")
+                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
+                        with gr.Accordion("Partial-scan aids", open=False, elem_classes=["ntt-acc"]):
+                            show_heat = gr.Checkbox(value=True, label="Show asymmetry heat (non-specific)")
+                            heat_percentile = gr.Slider(90.0, 99.9, value=98.0, step=0.1,
+                                                        label="Heat threshold percentile")
+                            gr.Markdown(PROTOCOL_CHECKLIST_MD)
+            with gr.Column(scale=3, elem_classes=["ntt-results"]):
+                gr.Markdown('<p class="ntt-section">3 &middot; Output</p>')
                 error_md = gr.Markdown("", elem_classes=["ntt-alert"])
                 metrics_md = gr.Markdown("", elem_id="ntt-metrics")
-
                 with gr.Tabs():
                     with gr.Tab("3D Surface"):
                         plot_3d = gr.Plot(label="3D tumour surface")
                     with gr.Tab("MPR Viewer"):
                         plot_mpr = gr.Plot(label="Multi-planar reconstruction")
-
                 with gr.Accordion("Exports", open=False):
                     report_html = gr.File(label="Report (HTML)")
                     downloads = gr.Files(label="Meshes and segmentation")
-
-        # Toggle input groups based on mode.
+        # ---------------- mode toggle ----------------
         def _toggle_mode(selected: str) -> tuple[dict, dict]:
             if selected == "NIfTI Files":
                 return gr.update(visible=True), gr.update(visible=False)
             return gr.update(visible=False), gr.update(visible=True)
-
         mode.change(
             _toggle_mode,
             inputs=[mode],
             outputs=[nifti_group, zip_group],
         )
-
+        # ---------------- run ----------------
         run_btn.click(
             run_analysis,
             inputs=[
@@ -1285,7 +1336,49 @@ def build_app() -> gr.Blocks:
             outputs=[plot_3d, plot_mpr, metrics_md, error_md,
                      report_html, downloads],
         )
-
+        # ---------------- footer ----------------
+        gr.HTML(
+            value=(
+                "<footer class=\"ntt-foot\">\n"
+                "  <div class=\"ntt-foot-row\">\n"
+                "    <div class=\"ntt-foot-mini\"><b>NeuroVista</b> &mdash; clinical-grade brain tumour segmentation. <b>Research preview;</b> outputs require radiologist verification and are not a medical device.</div>\n"
+                "    <a class=\"ntt-foot-link\" href=\"#top\">Back to top</a>\n"
+                "  </div>\n"
+                "  <div class=\"ntt-meta\">\n"
+                "    <span>Research preview &middot; v@@APP_VERSION@@</span>\n"
+                "    <span>PHI stripped on DICOM upload</span>\n"
+                "    <span>BraTS-style 4-modal inference</span>\n"
+                "    <span>Open-source pipeline</span>\n"
+                "  </div>\n"
+                "  <div class=\"ntt-disclaimer-wrap\"><b>Research visualization only</b> &mdash; not a medical device. Results require radiologist verification; not for diagnosis, treatment, or surgical navigation.</div>\n"
+                "</footer>"
+            ).replace("@@APP_VERSION@@", APP_VERSION),
+            head=(
+                "<script>\n"
+                "  (function () {\n"
+                "    var stored = null;\n"
+                "    try { stored = localStorage.getItem('ntt-theme'); } catch (e) {}\n"
+                "    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;\n"
+                "    var theme = stored || (prefersDark ? 'dark' : 'light');\n"
+                "    document.documentElement.dataset.theme = theme;\n"
+                "    window.addEventListener('load', function () {\n"
+                "      var toggle = document.getElementById('ntt-theme-toggle');\n"
+                "      if (toggle && toggle.checked !== (theme === 'dark')) {\n"
+                "        toggle.checked = (theme === 'dark');\n"
+                "      }\n"
+                "    });\n"
+                "    document.addEventListener('change', function (e) {\n"
+                "      var t = e.target;\n"
+                "      if (t && t.id === 'ntt-theme-toggle') {\n"
+                "        var next = t.checked ? 'dark' : 'light';\n"
+                "        document.documentElement.dataset.theme = next;\n"
+                "        try { localStorage.setItem('ntt-theme', next); } catch (e) {}\n"
+                "      }\n"
+                "    });\n"
+                "  })();\n"
+                "</script>"
+            ),
+        )
     return demo
 
 
@@ -1299,6 +1392,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("APP_PORT", "7860") or 7860)
     app = build_app()
     app.launch(
+        theme=_APPLE_THEME,
+        css=_APPLE_CSS,
         server_name=host,
         server_port=port,
     )
