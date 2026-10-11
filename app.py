@@ -1192,6 +1192,143 @@ body { margin: 0; background: var(--ntt-bg); color: var(--ntt-ink);
     --ntt-shadow-2: 0 14px 40px rgba(0,0,0,.42);
   }
 }
+
+/* ============================================================================
+   COMPONENT STYLES — nav, theme toggle, hero
+   ============================================================================ */
+.gradio-container { max-width: 1180px !important; margin: 0 auto !important; }
+
+/* ---- sticky nav ---- */
+.ntt-nav { position: sticky; top: 0; z-index: 60;
+  background: rgba(247,247,249,.82); border-bottom: 1px solid var(--ntt-border);
+  -webkit-backdrop-filter: saturate(180%) blur(18px); backdrop-filter: saturate(180%) blur(18px); }
+html[data-theme="dark"] .ntt-nav { background: rgba(5,6,11,.74); }
+@media (prefers-color-scheme: dark) { html:not([data-theme]) .ntt-nav { background: rgba(5,6,11,.74); } }
+.ntt-row { display: flex; align-items: center; gap: 18px; padding: 11px 24px; }
+.ntt-logo { display: flex; align-items: center; gap: 11px; margin-right: auto; }
+.ntt-logo-mark { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+  font-weight: 800; font-size: 17px; color: #fff;
+  background: linear-gradient(135deg, var(--ntt-accent), var(--ntt-accent-2));
+  box-shadow: 0 4px 12px rgba(10,132,255,.30); }
+.ntt-logo-name { font-weight: 700; font-size: 15px; letter-spacing: -.01em; line-height: 1.15; color: var(--ntt-ink); }
+.ntt-logo-tag { font-size: 11.5px; color: var(--ntt-ink-3); line-height: 1.2; }
+.ntt-nav-links { display: flex; gap: 22px; }
+.ntt-nav-links a { color: var(--ntt-ink-2); text-decoration: none; font-size: 13.5px; font-weight: 500; }
+.ntt-nav-links a:hover { color: var(--ntt-accent); }
+
+/* ---- theme toggle (compact pill) ---- */
+.ntt-theme { display: flex; align-items: center; gap: 9px; }
+.ntt-theme-label { font-size: 12px; font-weight: 500; color: var(--ntt-ink-3); user-select: none; cursor: pointer; }
+.ntt-theme-input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.ntt-theme-visual { position: relative; display: inline-block; width: 48px; height: 27px;
+  border-radius: 999px; cursor: pointer; background: var(--ntt-bg-soft);
+  border: 1px solid var(--ntt-border-strong); transition: background .25s, border-color .25s; }
+.ntt-theme-visual::after { content: ""; position: absolute; top: 2px; left: 2px; width: 21px; height: 21px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  transition: transform .25s cubic-bezier(.4,0,.2,1); }
+.ntt-theme-input:checked + .ntt-theme-visual { background: var(--ntt-accent); border-color: var(--ntt-accent); }
+.ntt-theme-input:checked + .ntt-theme-visual::after { transform: translateX(21px); }
+.ntt-theme-visual svg { position: absolute; top: 50%; transform: translateY(-50%);
+  width: 12px; height: 12px; pointer-events: none; transition: opacity .25s; }
+.ntt-sun { right: 7px; color: #F5A623; opacity: 1; }
+.ntt-moon { left: 7px; color: #E7ECF5; opacity: 0; }
+.ntt-theme-input:checked + .ntt-theme-visual .ntt-sun { opacity: 0; }
+.ntt-theme-input:checked + .ntt-theme-visual .ntt-moon { opacity: 1; }
+.ntt-theme-visual:focus-within { outline: 2px solid var(--ntt-accent); outline-offset: 2px; }
+
+/* ---- hero ---- */
+.ntt-hero { position: relative; overflow: hidden; padding: 54px 24px 40px; }
+.ntt-eyebrow { margin: 0 0 14px; font-size: 12.5px; font-weight: 600; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--ntt-accent); }
+.ntt-hero h1 { margin: 0 0 18px; font-size: clamp(34px, 5vw, 56px); line-height: 1.05;
+  font-weight: 800; letter-spacing: -.03em; color: var(--ntt-ink); }
+.ntt-grad { background: linear-gradient(120deg, var(--ntt-accent), var(--ntt-accent-2));
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.ntt-sub { margin: 0 0 24px; max-width: 640px; font-size: 17px; line-height: 1.55; color: var(--ntt-ink-3); }
+.ntt-hero-cta { display: flex; gap: 12px; margin-bottom: 34px; }
+.ntt-secondary { display: inline-block; padding: 11px 22px; border-radius: 999px; font-size: 14px;
+  font-weight: 600; color: var(--ntt-ink); background: var(--ntt-surface);
+  border: 1px solid var(--ntt-border-strong); box-shadow: var(--ntt-shadow-1); }
+.ntt-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; max-width: 840px; }
+.ntt-stat { display: flex; flex-direction: column; gap: 3px; padding: 16px 18px;
+  background: var(--ntt-surface); border: 1px solid var(--ntt-border);
+  border-radius: var(--ntt-radius-sm); box-shadow: var(--ntt-shadow-1); }
+.ntt-num { font-size: 22px; font-weight: 750; letter-spacing: -.02em; color: var(--ntt-ink); }
+.ntt-raw { font-size: 11.5px; line-height: 1.35; color: var(--ntt-ink-3); }
+.ntt-aura { position: absolute; top: -140px; right: -90px; width: 400px; height: 400px;
+  border-radius: 50%; z-index: -1; pointer-events: none;
+  background: radial-gradient(circle, rgba(10,132,255,.16), transparent 68%); }
+@media (max-width: 760px) { .ntt-stats { grid-template-columns: repeat(2, 1fr); } }
+/* ==== CONTINUED ==== */
+
+/* ---- section labels & hints ---- */
+.ntt-section { margin: 6px 0 12px; font-size: 12px; font-weight: 700; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--ntt-ink-3); }
+.ntt-hint { margin: 0 0 8px; font-size: 12.5px; color: var(--ntt-ink-3); }
+
+/* ---- layout columns (source / results cards) ---- */
+.ntt-side, .ntt-results { background: var(--ntt-surface); border: 1px solid var(--ntt-border);
+  border-radius: var(--ntt-radius); padding: 20px 22px; box-shadow: var(--ntt-shadow-1); }
+.ntt-col { min-width: 0; }
+
+/* ---- upload dropzones / groups ---- */
+.ntt-uploads { border: 1px dashed var(--ntt-border-strong); border-radius: var(--ntt-radius-sm);
+  padding: 14px 16px; background: var(--ntt-surface-soft); margin-bottom: 8px; }
+.ntt-uploads .gr-file, .ntt-uploads .gr-form { border: none !important; background: transparent !important; }
+
+/* ---- primary button ---- */
+.ntt-primary, #ntt-run { font-weight: 650 !important; font-size: 15px !important;
+  border: none !important; border-radius: 12px !important;
+  background: linear-gradient(180deg, var(--ntt-accent), var(--ntt-accent-ink)) !important;
+  box-shadow: 0 6px 18px rgba(10,132,255,.28) !important; }
+.ntt-primary:hover, #ntt-run:hover { filter: brightness(1.05); }
+
+/* ---- accordions ---- */
+.ntt-acc { border: 1px solid var(--ntt-border) !important; border-radius: var(--ntt-radius-sm) !important;
+  background: var(--ntt-surface-soft) !important; }
+
+/* ---- results panel ---- */
+.ntt-results .gr-markdown, #ntt-metrics { color: var(--ntt-ink-2); }
+#ntt-metrics table { width: 100%; border-collapse: collapse; }
+#ntt-metrics th, #ntt-metrics td { text-align: left; padding: 9px 12px;
+  border-bottom: 1px solid var(--ntt-border); font-size: 13.5px; }
+#ntt-metrics th { color: var(--ntt-ink-3); font-weight: 600; }
+.ntt-results .gr-plot, .ntt-results .gr-plot > div { border-radius: var(--ntt-radius-sm); overflow: hidden; }
+
+/* ---- alert / error strip ---- */
+.ntt-alert { border-radius: var(--ntt-radius-sm); }
+.ntt-alert:not(:empty) { border: 1px solid rgba(255,69,58,.35); background: rgba(255,69,58,.08);
+  color: #C7362B; padding: 10px 14px; border-radius: var(--ntt-radius-sm); }
+html[data-theme="dark"] .ntt-alert:not(:empty) { color: #FF8E84; border-color: rgba(255,69,58,.4); }
+
+/* ---- mode radio as segmented control ---- */
+#ntt-mode { background: var(--ntt-surface-soft); border: 1px solid var(--ntt-border);
+  border-radius: 12px; padding: 6px 10px; }
+#ntt-mode label { font-weight: 550; }
+
+/* ---- tabs ---- */
+.ntt-results .gr-tabs button, .ntt-results .tab-nav button { font-weight: 600; }
+
+/* ---- footer ---- */
+.ntt-foot { max-width: 1180px; margin: 8px auto 0; padding: 26px 24px 44px;
+  border-top: 1px solid var(--ntt-border); }
+.ntt-foot-row { display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+.ntt-foot-mini { font-size: 13px; line-height: 1.5; color: var(--ntt-ink-2); max-width: 820px; }
+.ntt-foot-mini b { color: var(--ntt-ink); }
+.ntt-foot-link { font-size: 13px; font-weight: 600; color: var(--ntt-accent); text-decoration: none;
+  border: 1px solid var(--ntt-border-strong); border-radius: 999px; padding: 6px 14px; }
+.ntt-foot-link:hover { border-color: var(--ntt-accent); }
+.ntt-meta { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 12.5px;
+  color: var(--ntt-ink-3); margin-bottom: 16px; }
+.ntt-disclaimer-wrap { font-size: 12px; line-height: 1.55; color: var(--ntt-ink-3);
+  border-top: 1px dashed var(--ntt-border); padding-top: 12px; }
+
+@media (max-width: 760px) {
+  .ntt-row { flex-wrap: wrap; gap: 10px; padding: 10px 16px; }
+  .ntt-hero { padding: 36px 16px 28px; }
+  .ntt-side, .ntt-results { padding: 16px; }
+}
 """
 
 
@@ -1205,7 +1342,7 @@ def build_app() -> gr.Blocks:
         # ---------------- top nav ----------------
         gr.HTML(
             f"""
-            <header class="ntt-nav">
+            <header class="ntt-nav" id="top">
               <div class="ntt-row">
                 <div class="ntt-logo">
                   <div class="ntt-logo-mark">N</div>
@@ -1221,7 +1358,7 @@ def build_app() -> gr.Blocks:
                 <div class="ntt-theme">
                   <label class="ntt-theme-label" for="ntt-theme-toggle">Theme</label>
                   <input type="checkbox" id="ntt-theme-toggle" class="ntt-theme-input">
-                  <div class="ntt-theme-visual">
+                  <label class="ntt-theme-visual" for="ntt-theme-toggle">
                     <svg class="ntt-sun" viewBox="0 0 24 24" fill="none">
                       <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="2.2"/>
                       <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M4.8 4.8l2.1 2.1M17.1 17.1l2.1 2.1M4.8 19.2l2.1-2.1M17.1 6.9l2.1-2.1"
@@ -1231,7 +1368,7 @@ def build_app() -> gr.Blocks:
                       <path d="M21.6 12.7A9.2 9.2 0 1 1 11.3 2.4a7 7 0 0 0 10.3 10.3z"
                             stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
                     </svg>
-                  </div>
+                  </label>
                 </div>
               </div>
             </header>
