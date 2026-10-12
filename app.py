@@ -46,7 +46,8 @@ from src.partial_analysis import (
     blend_heat_overlay,
     ellipsoid_estimate,
 )
-from src.postprocess import cleanup_prediction, rano_diameters, tumor_flag
+from src.postprocess import (cleanup_prediction, rano_classification,
+                             rano_diameters, tumor_flag)
 from src.report import write_html_report
 
 # ---------------------------------------------------------------------------
@@ -263,6 +264,115 @@ def _build_metrics_markdown(volumes: dict[str, float],
               "> Research visualization only — not for diagnosis. "
               "Requires radiologist verification."]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Longitudinal prior comparison (RANO-style delta)
+# ---------------------------------------------------------------------------
+
+def _spd(wt_mask: np.ndarray, spacing) -> float:
+    r = rano_diameters(wt_mask, spacing)
+    return float(r["dmax_mm"]) * float(r["dperp_mm"])
+
+
+def _synthesize_demo_prior(current_seg: np.ndarray, scenario: str):
+    """Synthetic same-shape prior for demo only (no registration).
+
+    Regression -> prior LARGER (dilated shell) => current reads as shrinkage.
+    Progression -> prior SMALLER (eroded) => current reads as growth.
+    """
+    if scenario not in ("Regression (tumour shrank)",
+                        "Progression (tumour grew)"):
+        return None
+    from scipy.ndimage import binary_dilation, binary_erosion
+    prior = current_seg.astype(np.int16).copy()
+    wt = np.isin(current_seg, [1, 2, 3, 4])
+    if scenario.startswith("Regression"):
+        prior[binary_dilation(wt, iterations=3) & ~wt] = 2
+    else:
+        prior[~binary_erosion(wt, iterations=3)] = 0
+    prior[prior == 4] = 3
+    return prior
+
+
+def _load_prior_segmentation(prior_path, demo_scenario, current_seg):
+    if demo_scenario and demo_scenario != "Off":
+        return _synthesize_demo_prior(current_seg, demo_scenario)
+    if prior_path:
+        try:
+            prior = nib.load(prior_path).get_fdata().astype(np.int16)
+            prior[prior == 4] = 3
+            return prior
+        except Exception:
+            return None
+    return None
+
+
+def _compare_to_prior(current_seg: np.ndarray, prior_seg, metadata,
+                      spacing, current_volumes, synthetic: bool = False) -> dict:
+    if prior_seg is None:
+        return {"ok": False, "note": "no prior supplied"}
+    if prior_seg.shape != current_seg.shape:
+        return {"ok": False, "note":
+                (f"prior shape {tuple(prior_seg.shape)} does not match "
+                 f"current {tuple(current_seg.shape)} — volumetric comparison "
+                 "requires a same-space prior (no resampling applied)")}
+    prior = prior_seg.astype(np.int16).copy()
+    prior[prior == 4] = 3
+    prior_volumes = _compute_volumes(prior, metadata)
+    rows = []
+    for name in ("Necrotic Core", "Peritumoral Edema", "Enhancing Tumor",
+                 "Total Whole Tumor"):
+        p = float(prior_volumes[name])
+        c = float(current_volumes[name])
+        d = c - p
+        rows.append((name, p, c, d, (d / p * 100.0) if p > 1e-9 else None))
+    call, call_pct = rano_classification(
+        _spd(np.isin(current_seg, [1, 2, 3, 4]), spacing),
+        _spd(np.isin(prior, [1, 2, 3, 4]), spacing))
+    return {"ok": True, "rows": rows, "call": call, "call_pct": call_pct,
+            "synthetic": synthetic}
+
+
+def _comparison_markdown(cmp: dict) -> str:
+    if not cmp.get("ok"):
+        return "" if cmp.get("note") == "no prior supplied" else \
+            f"\n\n### Comparison to prior study\n\n> ⚠️ {cmp['note']}\n"
+    lines = ["", "### Comparison to prior study", "",
+             "| Structure | Prior (cm³) | Current (cm³) | Δ (cm³) | Δ (%) |",
+             "|-----------|------------:|--------------:|--------:|------:|"]
+    for name, p, c, d, pct in cmp["rows"]:
+        lines.append(f"| {name} | {p:.2f} | {c:.2f} | {d:+.2f} | "
+                     f"{'—' if pct is None else f'{pct:+.1f}'} |")
+    cp = cmp.get("call_pct")
+    lines += ["", f"**RANO-style response:** {cmp['call']}"
+              + (f" ({cp:+.1f}% SPD vs prior)" if cp is not None else ""), "",
+              "> Based on whole-tumor SPD: Progressive ≥ +25%, Partial "
+              "response ≤ −50%, otherwise Stable. Research use — "
+              "requires radiologist review."]
+    if cmp.get("synthetic"):
+        lines += ["", "> *Synthetic demo prior (demo only — not a real prior "
+                  "study).*"]
+    return "\n".join(lines)
+
+
+def _comparison_html(cmp: dict) -> str:
+    if not cmp.get("ok"):
+        return "" if cmp.get("note") == "no prior supplied" else \
+            f"<p><b>Comparison to prior:</b> {cmp['note']}</p>"
+    rows = "".join(
+        f"<tr><td>{n}</td><td>{p:.2f}</td><td>{c:.2f}</td><td>{d:+.2f}</td>"
+        f"<td>{'—' if pct is None else f'{pct:+.1f}'}</td></tr>"
+        for n, p, c, d, pct in cmp["rows"])
+    cp = cmp.get("call_pct")
+    return (f"<table border='1' cellpadding='6' cellspacing='0'>"
+            f"<tr><th>Structure</th><th>Prior cm3</th><th>Current cm3</th>"
+            f"<th>Delta cm3</th><th>Delta %</th></tr>{rows}</table>"
+            f"<p><b>RANO-style response:</b> {cmp['call']}"
+            f"{f' ({cp:+.1f}% SPD)' if cp is not None else ''}</p>"
+            f"<p><small>Progressive &ge; +25% SPD, Partial response "
+            f"&le; &minus;50% SPD, otherwise Stable.</small></p>"
+            f"{'<br><i>Synthetic demo prior.</i>' if cmp.get('synthetic') else ''}")
 
 
 def _discover_segmentation_path(
@@ -782,7 +892,9 @@ def load_available_dicom_volumes(
 def _run_pipeline(input_source: str | dict,
                   axial_idx: int, sagittal_idx: int, coronal_idx: int,
                   bg_modality: str, overlay_opacity: float,
-                  show_classes: list[int], cleanup_min_vox: int):
+                  show_classes: list[int], cleanup_min_vox: int,
+                  prior_path: Optional[str] = None,
+                  demo_prior: str = "Off"):
     """Shared pipeline for NIfTI + DICOM. Returns all UI outputs."""
     import tempfile
     workdir = tempfile.mkdtemp(prefix="brats_out_")
@@ -852,6 +964,12 @@ def _run_pipeline(input_source: str | dict,
                  nifti_path)
     snaps = _snapshot_mpr_pngs(scan_volume, seg_analysis, workdir)
     rano = rano_diameters(np.isin(seg_analysis, [1, 2, 3]), spacing)
+    prior_seg = _load_prior_segmentation(prior_path, demo_prior, seg_analysis)
+    cmp = _compare_to_prior(
+        seg_analysis, prior_seg, metadata, spacing, volumes,
+        synthetic=(prior_path is None
+                   and demo_prior not in (None, "", "Off")))
+    metrics_md += _comparison_markdown(cmp)
     report_text = build_ingestion_report(warnings) + f"\nModel: {ONNX_PATH}"
     report_text += f"\nSegmentation source: {seg_source}"
     if model_warning:
@@ -861,7 +979,8 @@ def _run_pipeline(input_source: str | dict,
     report = write_html_report(os.path.join(workdir, "report.html"), volumes,
                                rano, snaps,
                                report_text,
-                               scans.source)
+                               scans.source,
+                               comparison=_comparison_html(cmp))
     stl_list = [stl_paths[k] for k in sorted(stl_paths)]
     extra_downloads: list[str] = []
     if b_report:
@@ -909,6 +1028,8 @@ def run_analysis(
     anonymize: bool,
     show_heat: bool,
     heat_percentile: float,
+    prior_seg_file: Optional[gr.File] = None,
+    demo_prior: str = "Off",
 ) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None]:
     """Run the full analysis pipeline and return visual + text outputs.
 
@@ -950,7 +1071,10 @@ def run_analysis(
         plot_3d, plot_mpr, metrics_md, warn_md, report, downloads = \
             _run_pipeline(input_source, axial_idx, sagittal_idx, coronal_idx,
                           bg_modality.lower(), overlay_opacity,
-                          [int(c) for c in show_classes], cleanup_min_vox)
+                          [int(c) for c in show_classes], cleanup_min_vox,
+                          prior_path=(prior_seg_file.name
+                                      if prior_seg_file is not None else None),
+                          demo_prior=demo_prior)
         return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
 
     except IngestionError as exc:
@@ -1411,6 +1535,9 @@ def build_app() -> gr.Blocks:
                     t2_file = gr.File(label="T2", file_types=[".nii", ".nii.gz"])
                     flair_file = gr.File(label="FLAIR", file_types=[".nii", ".nii.gz"])
                     nifti_folder = gr.File(label="Folder or ZIP bundle (optional)", file_types=[".zip"])
+                    prior_seg_file = gr.File(label="Prior segmentation (optional)", file_types=[".nii", ".nii.gz"])
+                    demo_prior = gr.Radio(["Off", "Regression (tumour shrank)", "Progression (tumour grew)"],
+                                          value="Off", label="Synthesize demo prior")
                 with gr.Group(visible=False, elem_classes=["ntt-uploads"]) as zip_group:
                     gr.Markdown('<p class="ntt-hint"><b>One file</b> &mdash; zip of DICOM series; anonymize PHI on upload.</p>')
                     zip_file = gr.File(label="DICOM ZIP", file_types=[".zip"])
@@ -1469,6 +1596,7 @@ def build_app() -> gr.Blocks:
                 axial_slider, sagittal_slider, coronal_slider,
                 bg_modality, overlay_opacity, show_classes, cleanup_min_vox,
                 anonymize, show_heat, heat_percentile,
+                prior_seg_file, demo_prior,
             ],
             outputs=[plot_3d, plot_mpr, metrics_md, error_md,
                      report_html, downloads],

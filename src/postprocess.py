@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import label as cc_label
 
-__all__ = ["cleanup_prediction", "rano_diameters", "tumor_flag"]
+__all__ = ["cleanup_prediction", "rano_diameters", "tumor_flag",
+           "rano_classification"]
 
 
 def cleanup_prediction(pred: np.ndarray, min_voxels: int = 50) -> np.ndarray:
@@ -73,3 +74,28 @@ def tumor_flag(volumes: dict[str, float], threshold_cm3: float = 0.3) -> str:
         return (f"Tiny finding (WT {wt:.2f} cm3 < {threshold_cm3} cm3): "
                 "possible noise / small focus — confirm on MPR.")
     return ""
+
+
+def rano_classification(cur_spd: float,
+                        prior_spd: float) -> tuple[str, float | None]:
+    """RANO-style response call from change in whole-tumor SPD.
+
+    SPD (sum of perpendicular diameters) is approximated as
+    ``dmax_mm * dperp_mm`` from ``rano_diameters``. Thresholds (research
+    use — requires radiologist review):
+      * Progressive      >= +25% increase vs prior
+      * Partial response <= -50% decrease vs prior
+      * Stable           otherwise
+    Returns ``(call, pct_change)``; ``pct_change`` is None when the prior
+    has no measurable lesion (prior_spd <= 0) but the current does.
+    """
+    if prior_spd <= 0:
+        if cur_spd > 0:
+            return "New / no prior measurable lesion", None
+        return "Stable", 0.0
+    pct = (cur_spd - prior_spd) / prior_spd * 100.0
+    if pct >= 25.0:
+        return "Progressive", pct
+    if pct <= -50.0:
+        return "Partial response", pct
+    return "Stable", pct

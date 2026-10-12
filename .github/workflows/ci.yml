@@ -25,4 +25,5 @@ jobs:
           PYTHONPATH=. python tests/test_partial.py
           PYTHONPATH=. python tests/test_dicom_loader.py
           PYTHONPATH=. python tests/test_bratsify.py
+          PYTHONPATH=. python tests/test_compare_prior.py
           PYTHONPATH=. python tests/test_app_volumetry.py

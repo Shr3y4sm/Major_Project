@@ -120,12 +120,12 @@ docker run --rm -p 7860:7860 \
 |-- tests/
 |   |-- test_app_volumetry.py      Per-class cm3 regression + warnings
 |   |-- test_bratsify.py           BraTS-ifier unit + real-data e2e
+|   |-- test_compare_prior.py      Longitudinal prior-compare (RANO delta)
 |   |-- test_dicom_loader.py       Ingestion engine tests
 |   |-- test_partial.py            Partial-DICOM fallback tests
 |   `-- test_unified.py            Unified DICOM+NIfTI tests
 |-- sample_brats_patient/          Small sample inputs (git-ignored for PHI safety)
-|-- braintumour-phase-1.ipynb      Phase 1 model and preprocessing notebook
-`-- previous/braintumour-phase-0.ipynb
+`-- braintumour-phase-1.ipynb      Phase 1 model and preprocessing notebook
 ```
 
 ## Requirements

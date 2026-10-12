@@ -138,10 +138,22 @@ def test_model_health_warning_detects_placeholder_output():
         # Marker-free path isolates the prediction-health check.
         app_mod.ONNX_PATH = "/nonexistent/model.onnx"
         assert app_mod._model_health_warning(healthy) == ""
+        # A .PLACEHOLDER marker next to the ONNX -> healthy output still
+        # flagged. Uses a temp marker so the assertion holds regardless of
+        # whether real trained weights are installed.
+        import tempfile
+        from src.export_onnx import _placeholder_marker_path
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "model.onnx")
+            app_mod.ONNX_PATH = fake
+            marker = _placeholder_marker_path(fake)
+            assert not os.path.exists(marker)
+            assert app_mod._model_health_warning(healthy) == ""
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write("placeholder")
+            assert "placeholder marker" in app_mod._model_health_warning(healthy)
     finally:
         app_mod.ONNX_PATH = saved
-    # Real repo artifacts carry a marker -> even healthy output is flagged.
-    assert "placeholder marker" in app_mod._model_health_warning(healthy)
     print("PASS: test_model_health_warning_detects_placeholder_output")
 
 
