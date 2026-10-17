@@ -52,8 +52,15 @@ def test_nested_dotnii_dirs():
 
 
 def test_real_brats_folder_layout():
-    m = discover_nifti_files(
-        "sample_brats_patient/BraTS2021_00495")
+    """Real BraTS-portal layout (dirs named `*.nii`). Skipped if the
+    git-ignored sample dataset is absent, matching the other real-data
+    tests. The nested-directory discovery path itself is covered by
+    ``test_nested_dotnii_dirs`` so no coverage is lost on a bare clone."""
+    root = "sample_brats_patient/BraTS2021_00495"
+    if not os.path.isdir(root):
+        print(f"SKIP: test_real_brats_folder_layout (missing '{root}')")
+        return
+    m = discover_nifti_files(root)
     assert set(m) == {"t1", "t1ce", "t2", "flair"}
 
 
