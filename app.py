@@ -30,10 +30,9 @@ from scipy.ndimage import gaussian_filter, zoom
 from skimage import measure
 
 from src.anonymize import anonymize_dicom_zip
-from src.bratsify import BratsifyConfig, BratsifyReport, save_qa_png, write_provenance
+from src.bratsify import BratsifyConfig, BratsifyReport, write_provenance
 from src.dicom_loader import (
     IngestionError,
-    PatientScans,
     SpatialMetadata,
     prepare_for_inference,
 )
@@ -45,6 +44,10 @@ from src.partial_analysis import (
     asymmetry_heatmap,
     blend_heat_overlay,
     ellipsoid_estimate,
+)
+from src.pretrained_inference import (
+    is_available as pretrained_brats_available,
+    predict_brats_regions_with_explanations,
 )
 from src.postprocess import (cleanup_prediction, rano_classification,
                              rano_diameters, tumor_flag)
@@ -94,6 +97,18 @@ MPR_COLORS = {
 # ---------------------------------------------------------------------------
 
 _engine: Optional[ONNXInferenceEngine] = None
+
+
+def _use_pretrained_brats_model() -> bool:
+    """Select the installed public model while the local U-Net is a placeholder.
+
+    Set ``USE_PRETRAINED_BRATS=0`` to force the project's exported ONNX U-Net.
+    A trained local ONNX model takes precedence automatically once its
+    ``.PLACEHOLDER`` marker has been removed.
+    """
+    if os.environ.get("USE_PRETRAINED_BRATS", "1").lower() in ("0", "false", "no"):
+        return False
+    return pretrained_brats_available() and Path(str(ONNX_PATH) + ".PLACEHOLDER").is_file()
 
 
 def _purge_stale_workdirs() -> None:
@@ -593,8 +608,9 @@ def _overlay_segmentation(
     pred_slice: np.ndarray,
     opacity: float = 0.8,
     show_classes: list[int] | None = None,
+    confidence_slice: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Blend a segmentation overlay onto a grayscale scan slice (RGB)."""
+    """Blend segmentation and optional lower-support cues onto an MRI slice."""
     if show_classes is None:
         show_classes = [1, 2, 3]
     alpha_scale = float(np.clip(opacity, 0.0, 1.0)) / (200 / 255)
@@ -618,6 +634,16 @@ def _overlay_segmentation(
             rgb[mask, 1] = rgb[mask, 1] * (1 - a_eff / 255) + (g / 255) * (a_eff / 255)
             rgb[mask, 2] = rgb[mask, 2] * (1 - a_eff / 255) + (b / 255) * (a_eff / 255)
 
+    # Amber is reserved for tumour voxels with lower model support. It is a
+    # review cue, not an uncertainty-calibrated diagnosis.
+    if confidence_slice is not None:
+        low_support = (pred_slice > 0) & (confidence_slice < 0.70)
+        if low_support.any():
+            amber = np.array([245, 158, 11], dtype=float) / 255
+            alpha = 0.72
+            rgb[low_support] = ((1 - alpha) * rgb[low_support]
+                                + alpha * amber)
+
     return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
 
@@ -629,6 +655,7 @@ def _build_mpr_plot(
     coronal_idx: int,
     opacity: float = 0.8,
     show_classes: list[int] | None = None,
+    confidence_map: np.ndarray | None = None,
 ) -> go.Figure:
     """Build a 3-panel MPR viewer with segmentation overlays.
 
@@ -647,11 +674,14 @@ def _build_mpr_plot(
     coronal_idx = int(np.clip(coronal_idx, 0, H - 1))
 
     axial = _overlay_segmentation(scan_volume[axial_idx], pred_orig[axial_idx],
-                                  opacity, show_classes)
+                                  opacity, show_classes,
+                                  None if confidence_map is None else confidence_map[axial_idx])
     sagittal = _overlay_segmentation(scan_volume[:, :, sagittal_idx], pred_orig[:, :, sagittal_idx],
-                                     opacity, show_classes)
+                                     opacity, show_classes,
+                                     None if confidence_map is None else confidence_map[:, :, sagittal_idx])
     coronal = _overlay_segmentation(scan_volume[:, coronal_idx, :], pred_orig[:, coronal_idx, :],
-                                    opacity, show_classes)
+                                    opacity, show_classes,
+                                    None if confidence_map is None else confidence_map[:, coronal_idx, :])
 
     fig = go.Figure()
     fig.add_trace(go.Image(z=axial, name="Axial", xaxis="x", yaxis="y", hoverinfo="skip"))
@@ -659,7 +689,9 @@ def _build_mpr_plot(
     fig.add_trace(go.Image(z=coronal, name="Coronal", xaxis="x3", yaxis="y3", hoverinfo="skip"))
 
     fig.update_layout(
-        title="Multi-Planar Reconstruction (MPR) — Segmentation Overlay",
+        title=("Multi-Planar Reconstruction — tumour overlay; amber = lower model support"
+               if confidence_map is not None
+               else "Multi-Planar Reconstruction (MPR) — Segmentation Overlay"),
         paper_bgcolor="#050505",
         plot_bgcolor="#050505",
         font=dict(color="white"),
@@ -680,7 +712,8 @@ def _build_mpr_plot(
 
 
 def _snapshot_mpr_pngs(scan_volume: np.ndarray, pred_orig: np.ndarray,
-                     out_dir: str) -> list[str]:
+                     out_dir: str,
+                     confidence_map: np.ndarray | None = None) -> list[str]:
     """Save axial/sagittal/coronal overlay PNGs for the HTML report."""
     try:
         import matplotlib
@@ -692,11 +725,17 @@ def _snapshot_mpr_pngs(scan_volume: np.ndarray, pred_orig: np.ndarray,
     D, H, W = pred_orig.shape
     views = [
         ("axial", _overlay_segmentation(scan_volume[D // 2],
-                                        pred_orig[D // 2])),
+                                        pred_orig[D // 2],
+                                        confidence_slice=(None if confidence_map is None
+                                                          else confidence_map[D // 2]))),
         ("sagittal", _overlay_segmentation(scan_volume[:, :, W // 2],
-                                           pred_orig[:, :, W // 2])),
+                                           pred_orig[:, :, W // 2],
+                                           confidence_slice=(None if confidence_map is None
+                                                             else confidence_map[:, :, W // 2]))),
         ("coronal", _overlay_segmentation(scan_volume[:, H // 2, :],
-                                          pred_orig[:, H // 2, :])),
+                                          pred_orig[:, H // 2, :],
+                                          confidence_slice=(None if confidence_map is None
+                                                            else confidence_map[:, H // 2, :]))),
     ]
     paths = []
     for name, rgb in views:
@@ -894,12 +933,16 @@ def _run_pipeline(input_source: str | dict,
                   bg_modality: str, overlay_opacity: float,
                   show_classes: list[int], cleanup_min_vox: int,
                   prior_path: Optional[str] = None,
-                  demo_prior: str = "Off"):
+                  demo_prior: str = "Off",
+                  use_bratsify_override: Optional[bool] = None):
     """Shared pipeline for NIfTI + DICOM. Returns all UI outputs."""
     import tempfile
     workdir = tempfile.mkdtemp(prefix="brats_out_")
     _purge_stale_workdirs()
-    use_bratsify = os.environ.get("BRATSIFY", "1").lower() not in ("0", "false", "no")
+    use_bratsify = (os.environ.get("BRATSIFY", "1").lower()
+                    not in ("0", "false", "no"))
+    if use_bratsify_override is not None:
+        use_bratsify = use_bratsify_override
     b_report: Optional[BratsifyReport] = None
     qa_png_path = os.path.join(workdir, "bratsify_qa.png")
     if use_bratsify:
@@ -913,39 +956,67 @@ def _run_pipeline(input_source: str | dict,
             input_source, harmonize=True, ras_canonical=True, reference="t1ce"
         )
     tensor, metadata = prepare_for_inference(scans, target_size=TARGET_SIZE)
-    engine = _get_engine()
-    pred_128 = engine.predict_class_map(tensor)
-    pred_orig = _resample_prediction_to_original(pred_128, metadata)
+    confidence_map = None
+    modality_support: dict[str, float] | None = None
+    if _use_pretrained_brats_model():
+        # The public model consumes the aligned full-resolution modalities and
+        # returns a BraTS label map in that same space. It is used only while
+        # the project's own ONNX U-Net is the explicit placeholder artifact.
+        pred_orig, confidence_map, modality_support = \
+            predict_brats_regions_with_explanations(scans)
+        model_warning = (
+            "Inference engine: public pretrained MONAI BraTS model "
+            "(BraTS 2018; 3-region segmentation)."
+        )
+        model_name = "pretrained MONAI BraTS SegResNet"
+    else:
+        engine = _get_engine()
+        pred_128 = engine.predict_class_map(tensor)
+        pred_orig = _resample_prediction_to_original(pred_128, metadata)
+        model_warning = _model_health_warning(pred_128)
+        model_name = ONNX_PATH
     if cleanup_min_vox > 0:
         pred_orig = cleanup_prediction(pred_orig, min_voxels=cleanup_min_vox)
-    model_warning = _model_health_warning(pred_128)
 
-    # Single source of truth: metrics, overlays, snapshots and exports must
-    # all describe the SAME segmentation, otherwise the reported volumes
-    # disagree with what the user sees. Prefer the ground-truth sidecar
-    # (label-4 already remapped to 3) when one exists, else the prediction.
+    # The model output is the single source of truth for every displayed and
+    # exported result. Ground-truth sidecars remain evaluation-only inputs and
+    # must never replace a live prediction.
     scan_volume = scans.volumes.get(bg_modality, scans.volumes["flair"])
-    ref_seg, ref_path = None, None
-    if isinstance(input_source, dict):
-        ref_seg, ref_path = _load_reference_segmentation(
-            input_source, scans.volumes["t2"].shape)
-    if ref_seg is not None:
-        seg_analysis = ref_seg
-        seg_source = f"ground-truth sidecar ({os.path.basename(ref_path)})"
-    else:
-        seg_analysis = pred_orig
-        seg_source = f"model prediction ({ONNX_PATH})"
+    seg_analysis = pred_orig
+    seg_source = f"model prediction ({model_name})"
     volumes = _compute_volumes(seg_analysis, metadata)
     flag = tumor_flag(volumes, threshold_cm3=NORMAL_WT_THRESHOLD_CM3)
     metrics_md = _build_metrics_markdown(volumes, flag, source=seg_source,
                                          model_warning=model_warning)
+    if confidence_map is not None:
+        tumor_confidence = confidence_map[seg_analysis > 0]
+        mean_confidence = (float(tumor_confidence.mean())
+                           if tumor_confidence.size else 0.0)
+        lower_support_fraction = (float(np.mean(tumor_confidence < 0.70))
+                                  if tumor_confidence.size else 0.0)
+        metrics_md += (
+            "\n\n---\n\n### Explainability review\n\n"
+            f"**Mean model support within segmented tumour:** {mean_confidence:.0%}. "
+            "This is region-probability support, not calibrated diagnostic certainty.\n\n"
+            "Review low-support or anatomically implausible regions against all source sequences before accepting the segmentation."
+        )
+        if modality_support:
+            ranking = sorted(modality_support.items(), key=lambda item: item[1], reverse=True)
+            ranked_text = " · ".join(
+                f"{name.upper()} {score:.0%}" for name, score in ranking
+            )
+            metrics_md += (
+                "\n\n**Modality sensitivity (single-sequence occlusion):** "
+                f"{ranked_text}. Higher values mean withholding that sequence changed the model output more."
+            )
 
     plot_3d = _build_3d_plot(seg_analysis, scans.volumes["t2"],
                              None, show_classes=show_classes)
     plot_mpr = _build_mpr_plot(scan_volume, seg_analysis, axial_idx,
                                sagittal_idx, coronal_idx,
                                opacity=overlay_opacity,
-                               show_classes=show_classes)
+                               show_classes=show_classes,
+                               confidence_map=confidence_map)
     # Exports
     t2_meta = metadata["t2"]
     spacing = tuple(float(s) for s in t2_meta.voxel_spacing_mm)
@@ -962,7 +1033,8 @@ def _run_pipeline(input_source: str | dict,
     except Exception:
         nib.save(nib.Nifti1Image(seg_analysis.astype(np.int16), np.eye(4)),
                  nifti_path)
-    snaps = _snapshot_mpr_pngs(scan_volume, seg_analysis, workdir)
+    snaps = _snapshot_mpr_pngs(scan_volume, seg_analysis, workdir,
+                               confidence_map=confidence_map)
     rano = rano_diameters(np.isin(seg_analysis, [1, 2, 3]), spacing)
     prior_seg = _load_prior_segmentation(prior_path, demo_prior, seg_analysis)
     cmp = _compare_to_prior(
@@ -970,7 +1042,7 @@ def _run_pipeline(input_source: str | dict,
         synthetic=(prior_path is None
                    and demo_prior not in (None, "", "Off")))
     metrics_md += _comparison_markdown(cmp)
-    report_text = build_ingestion_report(warnings) + f"\nModel: {ONNX_PATH}"
+    report_text = build_ingestion_report(warnings) + f"\nModel: {model_name}"
     report_text += f"\nSegmentation source: {seg_source}"
     if model_warning:
         report_text += f"\n{model_warning}"
@@ -980,7 +1052,15 @@ def _run_pipeline(input_source: str | dict,
                                rano, snaps,
                                report_text,
                                scans.source,
-                               comparison=_comparison_html(cmp))
+                               comparison=_comparison_html(cmp),
+                               explainability=(
+                                   "Mean model support within segmented tumour: "
+                                   f"{mean_confidence:.0%}. "
+                                   f"{lower_support_fraction:.1%} of segmented tumour voxels "
+                                   "were below the 70% review threshold. Amber in the MPR "
+                                   "snapshots marks those lower-support regions. This is a "
+                                   "model-review cue, not calibrated diagnostic certainty."
+                               ) if confidence_map is not None else "")
     stl_list = [stl_paths[k] for k in sorted(stl_paths)]
     extra_downloads: list[str] = []
     if b_report:
@@ -1030,13 +1110,13 @@ def run_analysis(
     heat_percentile: float,
     prior_seg_file: Optional[gr.File] = None,
     demo_prior: str = "Off",
-) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None]:
+) -> tuple[go.Figure, go.Figure, str, str, str, Optional[str], list[str] | None]:
     """Run the full analysis pipeline and return visual + text outputs.
 
     Returns:
-        (plot_3d, plot_mpr, metrics_md, warn_md, report_html, downloads)
+        (plot_3d, plot_mpr, metrics_md, status_md, error_md, report_html,
+        downloads)
     """
-    error_md = ""
     try:
         # --- Build input source (BOTH DICOM + NIfTI compatible) ---
         if mode == "NIfTI Files":
@@ -1075,7 +1155,7 @@ def run_analysis(
                           prior_path=(prior_seg_file.name
                                       if prior_seg_file is not None else None),
                           demo_prior=demo_prior)
-        return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
+        return plot_3d, plot_mpr, metrics_md, warn_md, "", report, downloads
 
     except IngestionError as exc:
         # Partial-DICOM fallback: instead of blank viewers, render the
@@ -1127,7 +1207,6 @@ def run_analysis(
                             from src.dicom_loader import \
                                 _infer_modality_from_dicom as _inf
                             if _inf(_m) == pick:
-                                import nibabel as _nib
                                 from src.dicom_loader import \
                                     _convert_dicom_series_to_nifti as _cv
                                 _, _aff = _cv(_fl, _tmp or _root)
@@ -1183,21 +1262,93 @@ def run_analysis(
                 error_md = (f"### Ingestion note\n\n{exc}\n\n"
                             "Showing partial-data analysis above "
                             "(anatomy + asymmetry heat + geometric estimate).")
-                return plot_3d, plot_mpr, metrics_md, \
-                    warn_md + "\n\n" + error_md, None, None
+                return plot_3d, plot_mpr, metrics_md, warn_md, error_md, None, None
         error_md = f"### Ingestion note\n\n{exc}"
     except FileNotFoundError as exc:
         error_md = f"### Model / file note\n\n{exc}"
     except Exception as exc:  # noqa: BLE001 - surface all runtime errors in UI
         error_md = f"### Processing note\n\n{exc}"
 
-    # Return empty placeholders on error.
-    empty_fig = go.Figure()
-    empty_fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        font=dict(color="white"), title="No data to display",
+    # Keep the last successful study visible. A validation error should guide
+    # the next action, not erase a result that a user may still be reviewing.
+    return (gr.skip(), gr.skip(), gr.skip(), "", error_md,
+            gr.skip(), gr.skip())
+
+
+def run_local_brats_demo(
+    axial_idx: int = 78,
+    sagittal_idx: int = 120,
+    coronal_idx: int = 120,
+    bg_modality: str = "flair",
+    overlay_opacity: float = 0.8,
+    show_classes: Optional[list[int]] = None,
+    cleanup_min_vox: int = 50,
+) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None]:
+    """Run the bundled four-modal BraTS study without a manual upload.
+
+    This is a convenience path for the presentation demo. It uses exactly the
+    same ingestion and analysis pipeline as uploaded NIfTI studies.
+    """
+    source = {
+        "t1": "BRATS/BraTS20_Training_002_t1.nii",
+        "t1ce": "BRATS/BraTS20_Training_002_t1ce.nii",
+        "t2": "BRATS/BraTS20_Training_002_t2.nii",
+        "flair": "BRATS/BraTS20_Training_002_flair.nii",
+    }
+    missing = [path for path in source.values() if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            "Local BraTS demo files are unavailable: " + ", ".join(missing)
+        )
+    return _run_pipeline(
+        source,
+        axial_idx,
+        sagittal_idx,
+        coronal_idx,
+        bg_modality.lower(),
+        overlay_opacity,
+        show_classes or [1, 2, 3],
+        cleanup_min_vox,
+        use_bratsify_override=False,
     )
-    return empty_fig, empty_fig, "", error_md, None, None
+
+
+def _message_update(value: str):
+    """Hide empty Markdown outputs so blank alert containers never render."""
+    return gr.update(value=value, visible=bool(value and value.strip()))
+
+
+def _analysis_outputs_for_ui(result):
+    """Map pipeline output into visible-on-demand status and error messages."""
+    (plot_3d, plot_mpr, metrics_md, status_md, error_md,
+     report, downloads) = result
+    return (plot_3d, plot_mpr, metrics_md, _message_update(status_md),
+            _message_update(error_md), report, downloads)
+
+
+def run_analysis_ui(*args):
+    """UI adapter that prevents empty status and error panels from rendering."""
+    return _analysis_outputs_for_ui(run_analysis(*args))
+
+
+def run_local_brats_demo_ui(*args):
+    """Adapt the local demo for the UI's separate status and error strips."""
+    try:
+        plot_3d, plot_mpr, metrics_md, status_md, report, downloads = \
+            run_local_brats_demo(*args)
+        return _analysis_outputs_for_ui(
+            (plot_3d, plot_mpr, metrics_md, status_md, "", report, downloads)
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the UI actionable
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            font=dict(color="white"), title="Demo unavailable",
+        )
+        return _analysis_outputs_for_ui(
+            (empty_fig, empty_fig, "", "",
+             f"### Local demo note\n\n{exc}", None, None)
+        )
 
 
 # Apple-minimal UI theme (UI-only: component variable names are unchanged so
@@ -1214,86 +1365,75 @@ _APPLE_THEME = gr.themes.Base(
     font=_APPLE_FONT_STACK,
     font_mono="ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
 ).set(
-    body_background_fill="#F5F5F7",
-    body_background_fill_dark="#000000",
-    body_text_color="#1D1D1F",
-    body_text_color_dark="#F5F5F7",
-    body_text_color_subdued="#86868B",
+    body_background_fill="#F7FAFC",
+    body_background_fill_dark="#F7FAFC",
+    body_text_color="#102A43",
+    body_text_color_dark="#102A43",
+    body_text_color_subdued="#52667A",
     background_fill_primary="#FFFFFF",
-    background_fill_primary_dark="#1D1D1F",
-    background_fill_secondary="#F5F5F7",
-    background_fill_secondary_dark="#2C2C2E",
-    border_color_primary="#E5E5EA",
-    border_color_primary_dark="#38383A",
-    color_accent_soft="#E8F1FD",
-    color_accent_soft_dark="#0A2A4A",
-    button_primary_background_fill="#0071E3",
-    button_primary_background_fill_hover="#0077ED",
-    button_primary_background_fill_dark="#0A84FF",
-    button_primary_background_fill_hover_dark="#409CFF",
+    background_fill_primary_dark="#FFFFFF",
+    background_fill_secondary="#F1F5F9",
+    background_fill_secondary_dark="#F1F5F9",
+    border_color_primary="#D9E2EC",
+    border_color_primary_dark="#D9E2EC",
+    color_accent_soft="#E0F2FE",
+    color_accent_soft_dark="#E0F2FE",
+    button_primary_background_fill="#1D4ED8",
+    button_primary_background_fill_hover="#1E40AF",
+    button_primary_background_fill_dark="#1D4ED8",
+    button_primary_background_fill_hover_dark="#1E40AF",
     button_primary_text_color="#FFFFFF",
     button_primary_text_color_dark="#FFFFFF",
     button_primary_border_color="transparent",
     button_secondary_background_fill="#FFFFFF",
-    button_secondary_background_fill_hover="#F5F5F7",
-    button_secondary_background_fill_dark="#1D1D1F",
-    button_secondary_background_fill_hover_dark="#2C2C2E",
-    button_secondary_border_color="#D2D2D7",
-    button_secondary_border_color_dark="#48484A",
-    button_secondary_text_color="#1D1D1F",
-    button_secondary_text_color_dark="#F5F5F7",
+    button_secondary_background_fill_hover="#F1F5F9",
+    button_secondary_background_fill_dark="#FFFFFF",
+    button_secondary_background_fill_hover_dark="#F1F5F9",
+    button_secondary_border_color="#CBD5E1",
+    button_secondary_border_color_dark="#CBD5E1",
+    button_secondary_text_color="#102A43",
+    button_secondary_text_color_dark="#102A43",
     block_radius="16px",
     block_title_text_size="15px",
     block_label_text_size="12px",
     block_label_text_weight="600",
     input_background_fill="#FFFFFF",
-    input_background_fill_dark="#1D1D1F",
-    input_border_color="#D2D2D7",
-    input_border_color_dark="#48484A",
-    slider_color="#0071E3",
-    slider_color_dark="#0A84FF",
-    checkbox_background_color_selected="#0071E3",
-    checkbox_background_color_selected_dark="#0A84FF",
+    input_background_fill_dark="#FFFFFF",
+    input_border_color="#CBD5E1",
+    input_border_color_dark="#CBD5E1",
+    slider_color="#1D4ED8",
+    slider_color_dark="#1D4ED8",
+    checkbox_background_color_selected="#1D4ED8",
+    checkbox_background_color_selected_dark="#1D4ED8",
 )
 
 _APPLE_CSS = """
 
 /* ============================================================================
-   NEUROVISTA — design system (Apple-minimal + Awwwards craft)
-   Palette: bg #F7F7F9 · surface #FFFFFF · ink #1C1C1F · muted #6E6E73
-            accent #0A84FF (blue) · secondary #00C7A6 (teal)
-   Dark:  forced <html data-theme="dark"> · default to system pref
+   NEUROVISTA — accessible clinical workspace, light-only palette
    ============================================================================ */
 :root {
-  --ntt-bg: #F7F7F9;
-  --ntt-bg-soft: #EDEFF2;
+  --ntt-bg: #F7FAFC;
+  --ntt-bg-soft: #F1F5F9;
   --ntt-surface: #FFFFFF;
-  --ntt-surface-soft: #F5F5F7;
-  --ntt-ink: #1C1C1F;
-  --ntt-ink-2: #3F3F46;
-  --ntt-ink-3: #6E6E73;
-  --ntt-ink-4: #98989D;
-  --ntt-border: #E2E2E6;
-  --ntt-border-strong: #D2D2D7;
-  --ntt-accent: #0A84FF;
-  --ntt-accent-ink: #0A6FD4;
-  --ntt-accent-2: #00C7A6;
-  --ntt-shadow-1: 0 1px 2px rgba(28,28,31,.05), 0 10px 28px rgba(28,28,31,.06);
-  --ntt-shadow-2: 0 14px 40px rgba(28,28,31,.10);
+  --ntt-surface-soft: #F8FAFC;
+  --ntt-ink: #102A43;
+  --ntt-ink-2: #243B53;
+  --ntt-ink-3: #52667A;
+  --ntt-ink-4: #7B8FA1;
+  --ntt-border: #D9E2EC;
+  --ntt-border-strong: #BCCCDC;
+  --ntt-accent: #1D4ED8;
+  --ntt-accent-ink: #1E40AF;
+  --ntt-accent-2: #0F766E;
+  --ntt-shadow-1: 0 1px 2px rgba(16,42,67,.05), 0 8px 24px rgba(16,42,67,.07);
+  --ntt-shadow-2: 0 16px 40px rgba(16,42,67,.12);
   --ntt-radius: 18px;
   --ntt-radius-sm: 12px;
   --ntt-pill: 999px;
   --ntt-font: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display",
     "SF Pro Text", "Inter", "Helvetica Neue", Arial, sans-serif;
   --ntt-mono: "SF Mono", "IBM Plex Mono", ui-monospace, "Consolas", monospace;
-}
-html[data-theme="dark"] {
-  --ntt-bg: #05060B; --ntt-bg-soft: #0A0C14; --ntt-surface: #11131C;
-  --ntt-surface-soft: #171923; --ntt-ink: #F2F2F5; --ntt-ink-2: #C9C9D0;
-  --ntt-ink-3: #A1A1A6; --ntt-ink-4: #6E6E73; --ntt-border: #2A2D38;
-  --ntt-border-strong: #38383A; --ntt-accent: #3B8CFF; --ntt-accent-ink: #5B93FF;
-  --ntt-accent-2: #00D4AA; --ntt-shadow-1: 0 1px 2px rgba(0,0,0,.30),
-    0 10px 28px rgba(0,0,0,.34); --ntt-shadow-2: 0 14px 40px rgba(0,0,0,.42);
 }
 html, body { height: 100%; }
 body { margin: 0; background: var(--ntt-bg); color: var(--ntt-ink);
@@ -1306,59 +1446,39 @@ body { margin: 0; background: var(--ntt-bg); color: var(--ntt-ink);
   border-radius: 999px; border: 2px solid var(--ntt-bg); }
 ::-webkit-scrollbar-thumb:hover { background: var(--ntt-ink-3); }
 
-@media (prefers-color-scheme: dark) {
-  html:not([data-theme]) {
-    --ntt-bg: #05060B; --ntt-bg-soft: #0A0C14; --ntt-surface: #11131C;
-    --ntt-surface-soft: #171923; --ntt-ink: #F2F2F5; --ntt-ink-2: #C9C9D0;
-    --ntt-ink-3: #A1A1A6; --ntt-ink-4: #6E6E73; --ntt-border: #2A2D38;
-    --ntt-border-strong: #38383A; --ntt-accent: #3B8CFF; --ntt-accent-ink: #5B93FF;
-    --ntt-accent-2: #00D4AA; --ntt-shadow-1: 0 1px 2px rgba(0,0,0,.30), 0 10px 28px rgba(0,0,0,.34);
-    --ntt-shadow-2: 0 14px 40px rgba(0,0,0,.42);
-  }
-}
 
 /* ============================================================================
-   COMPONENT STYLES — nav, theme toggle, hero
+   COMPONENT STYLES — workflow workspace
    ============================================================================ */
 .gradio-container { max-width: 1180px !important; margin: 0 auto !important; }
-
-/* ---- sticky nav ---- */
-.ntt-nav { position: sticky; top: 0; z-index: 60;
-  background: rgba(247,247,249,.82); border-bottom: 1px solid var(--ntt-border);
-  -webkit-backdrop-filter: saturate(180%) blur(18px); backdrop-filter: saturate(180%) blur(18px); }
-html[data-theme="dark"] .ntt-nav { background: rgba(5,6,11,.74); }
-@media (prefers-color-scheme: dark) { html:not([data-theme]) .ntt-nav { background: rgba(5,6,11,.74); } }
-.ntt-row { display: flex; align-items: center; gap: 18px; padding: 11px 24px; }
-.ntt-logo { display: flex; align-items: center; gap: 11px; margin-right: auto; }
-.ntt-logo-mark { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
-  font-weight: 800; font-size: 17px; color: #fff;
-  background: linear-gradient(135deg, var(--ntt-accent), var(--ntt-accent-2));
-  box-shadow: 0 4px 12px rgba(10,132,255,.30); }
-.ntt-logo-name { font-weight: 700; font-size: 15px; letter-spacing: -.01em; line-height: 1.15; color: var(--ntt-ink); }
-.ntt-logo-tag { font-size: 11.5px; color: var(--ntt-ink-3); line-height: 1.2; }
-.ntt-nav-links { display: flex; gap: 22px; }
-.ntt-nav-links a { color: var(--ntt-ink-2); text-decoration: none; font-size: 13.5px; font-weight: 500; }
-.ntt-nav-links a:hover { color: var(--ntt-accent); }
-
-/* ---- theme toggle (compact pill) ---- */
-.ntt-theme { display: flex; align-items: center; gap: 9px; }
-.ntt-theme-label { font-size: 12px; font-weight: 500; color: var(--ntt-ink-3); user-select: none; cursor: pointer; }
-.ntt-theme-input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
-.ntt-theme-visual { position: relative; display: inline-block; width: 48px; height: 27px;
-  border-radius: 999px; cursor: pointer; background: var(--ntt-bg-soft);
-  border: 1px solid var(--ntt-border-strong); transition: background .25s, border-color .25s; }
-.ntt-theme-visual::after { content: ""; position: absolute; top: 2px; left: 2px; width: 21px; height: 21px;
-  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25);
-  transition: transform .25s cubic-bezier(.4,0,.2,1); }
-.ntt-theme-input:checked + .ntt-theme-visual { background: var(--ntt-accent); border-color: var(--ntt-accent); }
-.ntt-theme-input:checked + .ntt-theme-visual::after { transform: translateX(21px); }
-.ntt-theme-visual svg { position: absolute; top: 50%; transform: translateY(-50%);
-  width: 12px; height: 12px; pointer-events: none; transition: opacity .25s; }
-.ntt-sun { right: 7px; color: #F5A623; opacity: 1; }
-.ntt-moon { left: 7px; color: #E7ECF5; opacity: 0; }
-.ntt-theme-input:checked + .ntt-theme-visual .ntt-sun { opacity: 0; }
-.ntt-theme-input:checked + .ntt-theme-visual .ntt-moon { opacity: 1; }
-.ntt-theme-visual:focus-within { outline: 2px solid var(--ntt-accent); outline-offset: 2px; }
+footer { display: none !important; }
+.gradio-container, #input label, #input .label-wrap, #input .label-wrap span {
+  color: var(--ntt-ink) !important;
+}
+.gradio-container .label-wrap, .gradio-container .label-wrap *,
+.gradio-container .block-label, .gradio-container .block-label * {
+  color: var(--ntt-ink) !important;
+  opacity: 1 !important;
+}
+.ntt-source-mode, .ntt-source-mode *, .ntt-source-mode label,
+.ntt-source-mode span {
+  color: var(--ntt-ink) !important;
+  opacity: 1 !important;
+}
+#ntt-mode, #ntt-mode *, #ntt-mode label, #ntt-mode span {
+  color: #102A43 !important;
+  opacity: 1 !important;
+}
+/* Gradio's dark-system file uploader rules otherwise leak into a light page. */
+.ntt-file, .ntt-file > *, .ntt-file .wrap, .ntt-file .file-preview,
+.ntt-file .file-preview-holder, .ntt-file .file-preview > div {
+  background: #FFFFFF !important; color: var(--ntt-ink) !important;
+  border-color: var(--ntt-border-strong) !important;
+}
+.ntt-file label, .ntt-file span, .ntt-file button, .ntt-file div {
+  color: var(--ntt-ink) !important;
+}
+.ntt-file svg { color: var(--ntt-accent) !important; stroke: currentColor !important; }
 
 /* ---- hero ---- */
 .ntt-hero { position: relative; overflow: hidden; padding: 54px 24px 40px; }
@@ -1382,6 +1502,23 @@ html[data-theme="dark"] .ntt-nav { background: rgba(5,6,11,.74); }
 .ntt-aura { position: absolute; top: -140px; right: -90px; width: 400px; height: 400px;
   border-radius: 50%; z-index: -1; pointer-events: none;
   background: radial-gradient(circle, rgba(10,132,255,.16), transparent 68%); }
+.ntt-workspace-head { margin: 30px 24px 26px; padding: 26px 28px; position: relative;
+  overflow: hidden; border: 1px solid var(--ntt-border); border-radius: var(--ntt-radius);
+  background: linear-gradient(125deg, var(--ntt-surface), var(--ntt-surface-soft));
+  box-shadow: var(--ntt-shadow-1); }
+.ntt-workspace-head::after { content: ""; position: absolute; width: 340px; height: 340px;
+  right: -145px; top: -250px; border-radius: 50%; background: rgba(10,132,255,.12); }
+.ntt-workspace-kicker { margin: 0 0 7px; color: var(--ntt-accent); text-transform: uppercase;
+  letter-spacing: .11em; font-size: 11px; font-weight: 750; }
+.ntt-workspace-title { margin: 0; font-size: clamp(25px, 3vw, 36px); line-height: 1.12;
+  letter-spacing: -.025em; color: var(--ntt-ink); }
+.ntt-workspace-copy { margin: 9px 0 21px; max-width: 640px; color: var(--ntt-ink-3); font-size: 14px; }
+.ntt-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; position: relative; z-index: 1; }
+.ntt-flow-step { min-width: 0; padding: 12px 14px; border-radius: 10px; background: color-mix(in srgb, var(--ntt-surface) 80%, transparent);
+  border: 1px solid var(--ntt-border); }
+.ntt-flow-num { display: block; margin-bottom: 4px; color: var(--ntt-accent); font-size: 11px; font-weight: 750; letter-spacing: .08em; }
+.ntt-flow-label { display: block; color: var(--ntt-ink); font-size: 13px; font-weight: 700; }
+.ntt-flow-detail { display: block; margin-top: 2px; color: var(--ntt-ink-3); font-size: 12px; line-height: 1.35; }
 @media (max-width: 760px) { .ntt-stats { grid-template-columns: repeat(2, 1fr); } }
 /* ==== CONTINUED ==== */
 
@@ -1406,24 +1543,38 @@ html[data-theme="dark"] .ntt-nav { background: rgba(5,6,11,.74); }
   background: linear-gradient(180deg, var(--ntt-accent), var(--ntt-accent-ink)) !important;
   box-shadow: 0 6px 18px rgba(10,132,255,.28) !important; }
 .ntt-primary:hover, #ntt-run:hover { filter: brightness(1.05); }
+#ntt-demo { margin-top: 10px; border-radius: 12px !important; font-weight: 650 !important;
+  border: 1px solid var(--ntt-border-strong) !important; background: var(--ntt-surface) !important;
+  color: var(--ntt-ink) !important; }
+#ntt-demo:hover { border-color: var(--ntt-accent) !important; color: var(--ntt-accent) !important; }
+.ntt-ready { margin: 0 0 16px; padding: 12px 14px; border-radius: var(--ntt-radius-sm);
+  border: 1px solid rgba(0,199,166,.32); background: rgba(0,199,166,.08); color: var(--ntt-ink-2);
+  font-size: 12.5px; line-height: 1.45; }
+.ntt-ready b { color: var(--ntt-ink); }
+.ntt-ready-dot { display: inline-block; width: 8px; height: 8px; margin-right: 7px;
+  border-radius: 50%; background: var(--ntt-accent-2); box-shadow: 0 0 0 4px rgba(0,199,166,.12); }
+.ntt-step { margin: 0 0 14px; color: var(--ntt-ink-3); font-size: 13px; }
+.ntt-empty { padding: 28px 8px 20px; color: var(--ntt-ink-3); font-size: 14px; }
+.ntt-empty b { color: var(--ntt-ink-2); }
 
 /* ---- accordions ---- */
 .ntt-acc { border: 1px solid var(--ntt-border) !important; border-radius: var(--ntt-radius-sm) !important;
   background: var(--ntt-surface-soft) !important; }
 
 /* ---- results panel ---- */
-.ntt-results .gr-markdown, #ntt-metrics { color: var(--ntt-ink-2); }
+.ntt-results .gr-markdown, #ntt-metrics, #ntt-metrics * { color: var(--ntt-ink-2) !important; }
 #ntt-metrics table { width: 100%; border-collapse: collapse; }
 #ntt-metrics th, #ntt-metrics td { text-align: left; padding: 9px 12px;
-  border-bottom: 1px solid var(--ntt-border); font-size: 13.5px; }
-#ntt-metrics th { color: var(--ntt-ink-3); font-weight: 600; }
+  border-bottom: 1px solid var(--ntt-border); font-size: 13.5px; background: #FFFFFF; }
+#ntt-metrics th { color: var(--ntt-ink) !important; font-weight: 700; background: #F1F5F9; }
 .ntt-results .gr-plot, .ntt-results .gr-plot > div { border-radius: var(--ntt-radius-sm); overflow: hidden; }
 
-/* ---- alert / error strip ---- */
-.ntt-alert { border-radius: var(--ntt-radius-sm); }
-.ntt-alert:not(:empty) { border: 1px solid rgba(255,69,58,.35); background: rgba(255,69,58,.08);
-  color: #C7362B; padding: 10px 14px; border-radius: var(--ntt-radius-sm); }
-html[data-theme="dark"] .ntt-alert:not(:empty) { color: #FF8E84; border-color: rgba(255,69,58,.4); }
+/* ---- run status and error strips ---- */
+.ntt-status { border: 1px solid #93C5FD; background: #EFF6FF; color: #163A63;
+  padding: 12px 14px; border-radius: var(--ntt-radius-sm); }
+.ntt-alert { border: 1px solid #FCA5A5; background: #FEF2F2; color: #7F1D1D;
+  padding: 12px 14px; border-radius: var(--ntt-radius-sm); }
+.ntt-status p, .ntt-alert p { margin: 0; }
 
 /* ---- mode radio as segmented control ---- */
 #ntt-mode { background: var(--ntt-surface-soft); border: 1px solid var(--ntt-border);
@@ -1433,24 +1584,10 @@ html[data-theme="dark"] .ntt-alert:not(:empty) { color: #FF8E84; border-color: r
 /* ---- tabs ---- */
 .ntt-results .gr-tabs button, .ntt-results .tab-nav button { font-weight: 600; }
 
-/* ---- footer ---- */
-.ntt-foot { max-width: 1180px; margin: 8px auto 0; padding: 26px 24px 44px;
-  border-top: 1px solid var(--ntt-border); }
-.ntt-foot-row { display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
-.ntt-foot-mini { font-size: 13px; line-height: 1.5; color: var(--ntt-ink-2); max-width: 820px; }
-.ntt-foot-mini b { color: var(--ntt-ink); }
-.ntt-foot-link { font-size: 13px; font-weight: 600; color: var(--ntt-accent); text-decoration: none;
-  border: 1px solid var(--ntt-border-strong); border-radius: 999px; padding: 6px 14px; }
-.ntt-foot-link:hover { border-color: var(--ntt-accent); }
-.ntt-meta { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 12.5px;
-  color: var(--ntt-ink-3); margin-bottom: 16px; }
-.ntt-disclaimer-wrap { font-size: 12px; line-height: 1.55; color: var(--ntt-ink-3);
-  border-top: 1px dashed var(--ntt-border); padding-top: 12px; }
-
 @media (max-width: 760px) {
-  .ntt-row { flex-wrap: wrap; gap: 10px; padding: 10px 16px; }
   .ntt-hero { padding: 36px 16px 28px; }
+  .ntt-workspace-head { margin: 18px 16px 20px; padding: 20px; }
+  .ntt-flow { grid-template-columns: 1fr; }
   .ntt-side, .ntt-results { padding: 16px; }
 }
 """
@@ -1462,113 +1599,85 @@ html[data-theme="dark"] .ntt-alert:not(:empty) { color: #FF8E84; border-color: r
 
 
 def build_app() -> gr.Blocks:
+    engine_label = (
+        "Pretrained BraTS model ready for the local four-modal demo"
+        if _use_pretrained_brats_model()
+        else "Project ONNX 3D U-Net selected"
+    )
     with gr.Blocks(title="NeuroVista — Brain Tumour Segmentation") as demo:
-        # ---------------- top nav ----------------
+        # ---------------- workflow header ----------------
         gr.HTML(
-            f"""
-            <header class="ntt-nav" id="top">
-              <div class="ntt-row">
-                <div class="ntt-logo">
-                  <div class="ntt-logo-mark">N</div>
-                  <div class="ntt-logo-text">
-                    <div class="ntt-logo-name">NeuroVista</div>
-                    <div class="ntt-logo-tag">Brain tumour segmentation</div>
-                  </div>
-                </div>
-                <nav class="ntt-nav-links">
-                  <a href="#input">Input</a>
-                  <a href="#output">Output</a>
-                </nav>
-                <div class="ntt-theme">
-                  <label class="ntt-theme-label" for="ntt-theme-toggle">Theme</label>
-                  <input type="checkbox" id="ntt-theme-toggle" class="ntt-theme-input">
-                  <label class="ntt-theme-visual" for="ntt-theme-toggle">
-                    <svg class="ntt-sun" viewBox="0 0 24 24" fill="none">
-                      <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="2.2"/>
-                      <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M4.8 4.8l2.1 2.1M17.1 17.1l2.1 2.1M4.8 19.2l2.1-2.1M17.1 6.9l2.1-2.1"
-                            stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-                    </svg>
-                    <svg class="ntt-moon" viewBox="0 0 24 24" fill="none">
-                      <path d="M21.6 12.7A9.2 9.2 0 1 1 11.3 2.4a7 7 0 0 0 10.3 10.3z"
-                            stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
-                    </svg>
-                  </label>
-                </div>
-              </div>
-            </header>
             """
-        )
-        # ---------------- hero ----------------
-        gr.HTML(
-            f"""
-            <section class="ntt-hero">
-              <p class="ntt-eyebrow">NeuroVista &middot; clinical-grade segmentation</p>
-              <h1>Raw MRI <span class="ntt-grad">in.</span><br>Surgical-grade report <span class="ntt-grad">out.</span></h1>
-              <p class="ntt-sub">Four MRI sequences &rarr; 3D tumour volumes, surface renders and surgical exports, in under a minute, on a standard laptop.</p>
-              <div class="ntt-hero-cta">
-                <span class="ntt-secondary">Upload scans</span>
+            <section class="ntt-workspace-head">
+              <p class="ntt-workspace-kicker">NeuroVista &middot; MRI review workspace</p>
+              <h1 class="ntt-workspace-title">Segment, inspect, and export in one workspace.</h1>
+              <p class="ntt-workspace-copy">Use all four MRI modalities for model segmentation, then review region volumes, overlays, and a 3D surface before exporting the result.</p>
+              <div class="ntt-flow" aria-label="Analysis workflow">
+                <div class="ntt-flow-step"><span class="ntt-flow-num">01 · INPUT</span><span class="ntt-flow-label">Choose a study</span><span class="ntt-flow-detail">Four NIfTI scans or one DICOM ZIP.</span></div>
+                <div class="ntt-flow-step"><span class="ntt-flow-num">02 · ANALYSE</span><span class="ntt-flow-label">Run segmentation</span><span class="ntt-flow-detail">Use the local demo when presenting.</span></div>
+                <div class="ntt-flow-step"><span class="ntt-flow-num">03 · REVIEW</span><span class="ntt-flow-label">Inspect and export</span><span class="ntt-flow-detail">Volumetry, MPR, surface, report, meshes.</span></div>
               </div>
-              <div class="ntt-stats">
-                <div class="ntt-stat"><span class="ntt-num">1 mm</span><span class="ntt-raw">isometric</span></div>
-                <div class="ntt-stat"><span class="ntt-num">3 classes</span><span class="ntt-raw">necrotic &middot; oedema &middot; enhancing</span></div>
-                <div class="ntt-stat"><span class="ntt-num">128&#179;</span><span class="ntt-raw">volume grid</span></div>
-                <div class="ntt-stat"><span class="ntt-num">&lt; 60 s</span><span class="ntt-raw">typical run</span></div>
-              </div>
-              <div class="ntt-aura"></div>
             </section>
             """
         )
         # ---------------- controls ----------------
-        with gr.Row():
+        with gr.Row(elem_id="input"):
             with gr.Column(scale=1, elem_classes=["ntt-side"]):
                 gr.Markdown('<p class="ntt-section">1 &middot; Source</p>')
+                gr.HTML(
+                    f'<div class="ntt-ready"><span class="ntt-ready-dot"></span>'
+                    f'<b>Analysis ready</b><br>{engine_label}</div>'
+                )
                 mode = gr.Radio(
                     choices=["NIfTI Files", "DICOM ZIP"],
                     value="NIfTI Files",
-                    label="Source",
+                    show_label=False,
                     elem_id="ntt-mode",
+                    elem_classes=["ntt-source-mode"],
                 )
                 with gr.Group(visible=True, elem_classes=["ntt-uploads"]) as nifti_group:
                     gr.Markdown('<p class="ntt-hint"><b>4 required scans</b> &mdash; T1, T1ce, T2, FLAIR.</p>')
-                    t1_file = gr.File(label="T1", file_types=[".nii", ".nii.gz"])
-                    t1ce_file = gr.File(label="T1ce", file_types=[".nii", ".nii.gz"])
-                    t2_file = gr.File(label="T2", file_types=[".nii", ".nii.gz"])
-                    flair_file = gr.File(label="FLAIR", file_types=[".nii", ".nii.gz"])
-                    nifti_folder = gr.File(label="Folder or ZIP bundle (optional)", file_types=[".zip"])
-                    prior_seg_file = gr.File(label="Prior segmentation (optional)", file_types=[".nii", ".nii.gz"])
+                    t1_file = gr.File(label="T1", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
+                    t1ce_file = gr.File(label="T1ce", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
+                    t2_file = gr.File(label="T2", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
+                    flair_file = gr.File(label="FLAIR", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
+                    nifti_folder = gr.File(label="Folder or ZIP bundle (optional)", file_types=[".zip"], elem_classes=["ntt-file"])
+                    prior_seg_file = gr.File(label="Prior segmentation (optional)", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
                     demo_prior = gr.Radio(["Off", "Regression (tumour shrank)", "Progression (tumour grew)"],
                                           value="Off", label="Synthesize demo prior")
                 with gr.Group(visible=False, elem_classes=["ntt-uploads"]) as zip_group:
                     gr.Markdown('<p class="ntt-hint"><b>One file</b> &mdash; zip of DICOM series; anonymize PHI on upload.</p>')
-                    zip_file = gr.File(label="DICOM ZIP", file_types=[".zip"])
+                    zip_file = gr.File(label="DICOM ZIP", file_types=[".zip"], elem_classes=["ntt-file"])
                     anonymize = gr.Checkbox(value=True, label="Anonymize on upload (strip PHI, keep geometry)")
                 gr.Markdown('<p class="ntt-section">2 &middot; Configure</p>')
+                gr.Markdown('<p class="ntt-step">Upload a complete study, then start analysis. Advanced settings are optional.</p>')
                 run_btn = gr.Button("Run analysis", elem_classes=["ntt-primary"], elem_id="ntt-run")
-                with gr.Row():
-                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
-                        with gr.Accordion("Slice controls", open=False, elem_classes=["ntt-acc"]):
-                            axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial slice")
-                            sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal slice")
-                            coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal slice")
-                            bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR", label="Background")
-                            overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Overlay opacity")
-                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
-                        with gr.Accordion("Classes and cleanup", open=False, elem_classes=["ntt-acc"]):
-                            show_classes = gr.CheckboxGroup(
-                                [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2), (CLASS_NAMES[3], 3)],
-                                value=[1, 2, 3], label="Visible classes")
-                            cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
-                                                         label="Remove blobs smaller than (voxels)")
-                    with gr.Column(scale=1, elem_classes=["ntt-col"]):
-                        with gr.Accordion("Partial-scan aids", open=False, elem_classes=["ntt-acc"]):
-                            show_heat = gr.Checkbox(value=True, label="Show asymmetry heat (non-specific)")
-                            heat_percentile = gr.Slider(90.0, 99.9, value=98.0, step=0.1,
-                                                        label="Heat threshold percentile")
-                            gr.Markdown(PROTOCOL_CHECKLIST_MD)
-            with gr.Column(scale=3, elem_classes=["ntt-results"]):
+                demo_btn = gr.Button("Run local BraTS demo", elem_id="ntt-demo")
+                with gr.Accordion("Advanced view and cleanup", open=False, elem_classes=["ntt-acc"]):
+                    axial_slider = gr.Slider(0, 240, value=78, step=1, label="Axial slice")
+                    sagittal_slider = gr.Slider(0, 240, value=120, step=1, label="Sagittal slice")
+                    coronal_slider = gr.Slider(0, 240, value=120, step=1, label="Coronal slice")
+                    bg_modality = gr.Radio(["FLAIR", "T1CE"], value="FLAIR", label="Background")
+                    overlay_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Overlay opacity")
+                    show_classes = gr.CheckboxGroup(
+                        [(CLASS_NAMES[1], 1), (CLASS_NAMES[2], 2), (CLASS_NAMES[3], 3)],
+                        value=[1, 2, 3], label="Visible classes")
+                    cleanup_min_vox = gr.Slider(0, 500, value=50, step=10,
+                                                 label="Remove blobs smaller than (voxels)")
+                with gr.Accordion("Partial-scan aids", open=False, elem_classes=["ntt-acc"]):
+                    show_heat = gr.Checkbox(value=True, label="Show asymmetry heat (non-specific)")
+                    heat_percentile = gr.Slider(90.0, 99.9, value=98.0, step=0.1,
+                                                label="Heat threshold percentile")
+                    gr.Markdown(PROTOCOL_CHECKLIST_MD)
+            with gr.Column(scale=3, elem_classes=["ntt-results"], elem_id="output"):
                 gr.Markdown('<p class="ntt-section">3 &middot; Output</p>')
-                error_md = gr.Markdown("", elem_classes=["ntt-alert"])
-                metrics_md = gr.Markdown("", elem_id="ntt-metrics")
+                status_md = gr.Markdown("", visible=False, elem_classes=["ntt-status"])
+                error_md = gr.Markdown("", visible=False, elem_classes=["ntt-alert"])
+                metrics_md = gr.Markdown(
+                    '<div class="ntt-empty"><b>Results will appear here.</b><br>'
+                    'Run the local demo or upload all four MRI modalities to begin.</div>',
+                    elem_id="ntt-metrics",
+                )
                 with gr.Tabs():
                     with gr.Tab("3D Surface"):
                         plot_3d = gr.Plot(label="3D tumour surface")
@@ -1589,7 +1698,7 @@ def build_app() -> gr.Blocks:
         )
         # ---------------- run ----------------
         run_btn.click(
-            run_analysis,
+            run_analysis_ui,
             inputs=[
                 mode,
                 t1_file, t1ce_file, t2_file, flair_file, nifti_folder, zip_file,
@@ -1598,51 +1707,17 @@ def build_app() -> gr.Blocks:
                 anonymize, show_heat, heat_percentile,
                 prior_seg_file, demo_prior,
             ],
-            outputs=[plot_3d, plot_mpr, metrics_md, error_md,
+            outputs=[plot_3d, plot_mpr, metrics_md, status_md, error_md,
                      report_html, downloads],
         )
-        # ---------------- footer ----------------
-        gr.HTML(
-            value=(
-                "<footer class=\"ntt-foot\">\n"
-                "  <div class=\"ntt-foot-row\">\n"
-                "    <div class=\"ntt-foot-mini\"><b>NeuroVista</b> &mdash; clinical-grade brain tumour segmentation. <b>Research preview;</b> outputs require radiologist verification and are not a medical device.</div>\n"
-                "    <a class=\"ntt-foot-link\" href=\"#top\">Back to top</a>\n"
-                "  </div>\n"
-                "  <div class=\"ntt-meta\">\n"
-                "    <span>Research preview &middot; v@@APP_VERSION@@</span>\n"
-                "    <span>PHI stripped on DICOM upload</span>\n"
-                "    <span>BraTS-style 4-modal inference</span>\n"
-                "    <span>Open-source pipeline</span>\n"
-                "  </div>\n"
-                "  <div class=\"ntt-disclaimer-wrap\"><b>Research visualization only</b> &mdash; not a medical device. Results require radiologist verification; not for diagnosis, treatment, or surgical navigation.</div>\n"
-                "</footer>"
-            ).replace("@@APP_VERSION@@", APP_VERSION),
-            head=(
-                "<script>\n"
-                "  (function () {\n"
-                "    var stored = null;\n"
-                "    try { stored = localStorage.getItem('ntt-theme'); } catch (e) {}\n"
-                "    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;\n"
-                "    var theme = stored || (prefersDark ? 'dark' : 'light');\n"
-                "    document.documentElement.dataset.theme = theme;\n"
-                "    window.addEventListener('load', function () {\n"
-                "      var toggle = document.getElementById('ntt-theme-toggle');\n"
-                "      if (toggle && toggle.checked !== (theme === 'dark')) {\n"
-                "        toggle.checked = (theme === 'dark');\n"
-                "      }\n"
-                "    });\n"
-                "    document.addEventListener('change', function (e) {\n"
-                "      var t = e.target;\n"
-                "      if (t && t.id === 'ntt-theme-toggle') {\n"
-                "        var next = t.checked ? 'dark' : 'light';\n"
-                "        document.documentElement.dataset.theme = next;\n"
-                "        try { localStorage.setItem('ntt-theme', next); } catch (e) {}\n"
-                "      }\n"
-                "    });\n"
-                "  })();\n"
-                "</script>"
-            ),
+        demo_btn.click(
+            run_local_brats_demo_ui,
+            inputs=[
+                axial_slider, sagittal_slider, coronal_slider,
+                bg_modality, overlay_opacity, show_classes, cleanup_min_vox,
+            ],
+            outputs=[plot_3d, plot_mpr, metrics_md, status_md, error_md,
+                     report_html, downloads],
         )
     return demo
 

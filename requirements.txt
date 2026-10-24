@@ -10,6 +10,7 @@ scikit-image>=0.21.0
 
 # Deep learning
 torch>=2.0.0
+monai>=1.3.2
 
 # ONNX export + inference
 onnx>=1.14.0

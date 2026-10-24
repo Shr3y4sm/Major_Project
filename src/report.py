@@ -19,11 +19,11 @@ def _img_b64(path: str) -> str:
 def write_html_report(out_path: str, volumes: dict[str, float],
                       rano: dict, snapshots: list[str],
                       ingestion_notes: str, source: str,
-                      comparison: str = "") -> str:
+                      comparison: str = "", explainability: str = "") -> str:
     """Write a printable HTML report. Returns path.
 
     ``comparison`` is optional pre-rendered HTML for a longitudinal prior
-    comparison; omitted entirely when empty.
+    comparison; ``explainability`` is a plain-language model-review note.
     """
     rows = "".join(
         f"<tr><td>{k}</td><td>{v:.2f} cm3</td></tr>"
@@ -45,6 +45,7 @@ def write_html_report(out_path: str, volumes: dict[str, float],
 <p>Dmax {rano.get('dmax_mm')} mm x Dperp {rano.get('dperp_mm')} mm
 (slice {rano.get('slice')})</p>
 {f'<h3>Comparison to prior study</h3>{comparison}' if comparison else ''}
+{f'<h3>Model-support review</h3><p>{explainability}</p>' if explainability else ''}
 <h3>Snapshots (MPR)</h3><div>{imgs or '<i>no snapshots</i>'}</div>
 <h3>Ingestion / provenance</h3><pre>{ingestion_notes}</pre>
 <hr><p><i>Research visualization only — not for diagnosis or treatment
