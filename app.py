@@ -33,7 +33,9 @@ from src.anonymize import anonymize_dicom_zip
 from src.bratsify import BratsifyConfig, BratsifyReport, write_provenance
 from src.dicom_loader import (
     IngestionError,
+    PlanningSeries,
     SpatialMetadata,
+    inspect_surgical_planning_series,
     prepare_for_inference,
 )
 from src.inference import ONNXInferenceEngine
@@ -51,6 +53,7 @@ from src.pretrained_inference import (
 )
 from src.postprocess import (cleanup_prediction, rano_classification,
                              rano_diameters, tumor_flag)
+from src.planning_registration import prepare_planning_volume
 from src.report import write_html_report
 
 # ---------------------------------------------------------------------------
@@ -598,6 +601,77 @@ def _build_3d_plot(
     return fig
 
 
+def _build_surgical_planning_plot(tumour_plot: go.Figure,
+                                  planning_series: list | None = None
+                                  ) -> go.Figure:
+    """Present the existing tumour mesh as an explicitly draft planning layer.
+
+    Vessels and white-matter tracts are intentionally not inferred from the
+    routine four-sequence tumour study. Their absence must remain visible to a
+    surgeon until registered TOF-MRA/CTA and DTI data are available.
+    """
+    fig = go.Figure(tumour_plot)
+    loaded_roles = {item.role for item in planning_series or []}
+    anatomy_note = (
+        "Planning-image candidate loaded · registration QA pending"
+        if loaded_roles else
+        "Tumour layer only · no patient-specific vessels or tracts loaded"
+    )
+    fig.update_layout(
+        title="Pre-operative planning overview — draft tumour map",
+        annotations=[dict(
+            text=anatomy_note,
+            x=0.5, y=1.02, xref="paper", yref="paper", showarrow=False,
+            font=dict(color="#FDE68A", size=12),
+        )],
+        paper_bgcolor="#0B1220",
+        plot_bgcolor="#0B1220",
+        margin=dict(l=0, r=0, b=0, t=64),
+    )
+    return fig
+
+
+def _surgical_planning_markdown(volumes: dict[str, float],
+                                confidence_map: np.ndarray | None,
+                                planning_series: list | None = None) -> str:
+    """Create a surgeon-facing availability and review gate summary."""
+    whole_tumour = volumes.get("Total Whole Tumor", 0.0)
+    support = "Model-support map available for tumour review." if confidence_map is not None else \
+        "No model-support map is available for this inference path."
+    candidates = planning_series or []
+    def layer_status(role: str, required_action: str) -> tuple[str, str]:
+        match = next((item for item in candidates if item.role == role), None)
+        if match is None:
+            return "Not loaded", required_action
+        return ("Candidate detected", 
+                f"Validate and register ‘{match.description}’ before use")
+
+    vascular_status, vascular_action = layer_status(
+        "vascular", "Register TOF-MRA or CTA before corridor planning")
+    tract_status, tract_action = layer_status(
+        "tractography", "Register DTI/tractography before eloquent-pathway review")
+    functional_status, functional_action = layer_status(
+        "functional", "Add approved task-fMRI / mapping output if relevant")
+    detected = ("\n\n**Detected candidate planning series:** " + ", ".join(
+        f"{item.role} ({item.description})" for item in candidates
+    ) + ". They are not yet registered planning layers."
+                if candidates else "")
+    return (
+        "## Pre-operative planning gate\n\n"
+        "**Status: draft anatomical review — not approved for navigation.**\n\n"
+        "| Planning layer | Status | Required action |\n"
+        "| --- | --- | --- |\n"
+        f"| Tumour segmentation ({whole_tumour:.2f} cm³) | Available | Surgeon reviews contours against source MRI |\n"
+        f"| Intracranial vessels | {vascular_status} | {vascular_action} |\n"
+        f"| White-matter tracts | {tract_status} | {tract_action} |\n"
+        f"| Functional cortex | {functional_status} | {functional_action} |\n\n"
+        f"{support}\n\n"
+        f"{detected}\n\n"
+        "### Safety gate\n\n"
+        "No surgical trajectory or clearance distance is generated until critical anatomy is supplied, registered, and reviewed by the surgeon."
+    )
+
+
 # ---------------------------------------------------------------------------
 # MPR 2D viewer
 # ---------------------------------------------------------------------------
@@ -934,7 +1008,12 @@ def _run_pipeline(input_source: str | dict,
                   show_classes: list[int], cleanup_min_vox: int,
                   prior_path: Optional[str] = None,
                   demo_prior: str = "Off",
-                  use_bratsify_override: Optional[bool] = None):
+                  use_bratsify_override: Optional[bool] = None,
+                  planning_vascular_path: Optional[str] = None,
+                  planning_dwi_path: Optional[str] = None,
+                  planning_bval_path: Optional[str] = None,
+                  planning_bvec_path: Optional[str] = None,
+                  planning_same_patient_confirmed: bool = False):
     """Shared pipeline for NIfTI + DICOM. Returns all UI outputs."""
     import tempfile
     workdir = tempfile.mkdtemp(prefix="brats_out_")
@@ -1010,8 +1089,64 @@ def _run_pipeline(input_source: str | dict,
                 f"{ranked_text}. Higher values mean withholding that sequence changed the model output more."
             )
 
+    planning_series = []
+    if scans.source.startswith("dicom:") and isinstance(input_source, str):
+        try:
+            planning_series = inspect_surgical_planning_series(input_source)
+        except IngestionError as exc:
+            warnings.append(f"Planning-series discovery unavailable: {exc}")
+    if planning_vascular_path:
+        try:
+            planning_img = nib.load(planning_vascular_path)
+            if len(planning_img.shape) != 3:
+                raise ValueError(f"expected 3D volume, got {planning_img.shape}")
+            planning_series.append(PlanningSeries(
+                role="vascular",
+                series_uid="nifti-upload",
+                description=Path(planning_vascular_path).name,
+                protocol="NIfTI planning upload",
+                slice_count=int(planning_img.shape[0]),
+            ))
+        except Exception as exc:  # noqa: BLE001 - optional planning data
+            warnings.append(f"Vascular planning upload ignored: {exc}")
+
+    planning_downloads: list[str] = []
+    planning_inputs = [planning_dwi_path, planning_bval_path, planning_bvec_path]
+    if any(planning_inputs):
+        if not all(planning_inputs):
+            warnings.append(
+                "Diffusion planning upload ignored: upload DWI, .bval, and .bvec together.")
+        elif not planning_same_patient_confirmed:
+            warnings.append(
+                "Diffusion planning upload ignored: confirm that DWI and the four MRI scans "
+                "are from the same patient and pre-operative session.")
+        elif not isinstance(input_source, dict):
+            warnings.append(
+                "Diffusion planning upload is available for the four-file NIfTI workflow only.")
+        else:
+            try:
+                planning_output = os.path.join(workdir, "dwi_b0_on_t1_grid.nii.gz")
+                planning_report = os.path.join(workdir, "dwi_preparation.json")
+                result = prepare_planning_volume(
+                    input_source["t1"], planning_dwi_path, planning_output,
+                    planning_report, planning_bval_path)
+                planning_series.append(PlanningSeries(
+                    role="tractography",
+                    series_uid="nifti-dwi-upload",
+                    description=(f"{Path(planning_dwi_path).name} — b0 prepared "
+                                 f"on T1 grid (frame {result.selected_volume})"),
+                    protocol="DWI + bval/bvec upload; affine resampling only",
+                    slice_count=int(result.reference_shape[0]),
+                ))
+                planning_downloads.extend([planning_output, planning_report])
+            except Exception as exc:  # noqa: BLE001 - optional planning data
+                warnings.append(f"Diffusion planning upload ignored: {exc}")
+
     plot_3d = _build_3d_plot(seg_analysis, scans.volumes["t2"],
                              None, show_classes=show_classes)
+    surgical_plot = _build_surgical_planning_plot(plot_3d, planning_series)
+    surgical_summary = _surgical_planning_markdown(
+        volumes, confidence_map, planning_series)
     plot_mpr = _build_mpr_plot(scan_volume, seg_analysis, axial_idx,
                                sagittal_idx, coronal_idx,
                                opacity=overlay_opacity,
@@ -1079,9 +1214,11 @@ def _run_pipeline(input_source: str | dict,
         warn_md += ("\n\n" if warn_md else "") + "> " + model_warning
     if flag:
         warn_md += ("\n\n" if warn_md else "") + "> " + flag
-    downloads = stl_list + ([glb_path] if glb_path else []) + [nifti_path] + extra_downloads
+    downloads = (stl_list + ([glb_path] if glb_path else []) + [nifti_path]
+                 + extra_downloads + planning_downloads)
     _maybe_cleanup_workdir(workdir)
-    return plot_3d, plot_mpr, metrics_md, warn_md, report, downloads
+    return (plot_3d, plot_mpr, metrics_md, warn_md, report, downloads,
+            surgical_plot, surgical_summary)
 
 
 def _reference_path_for_export(input_source, ref_key: str) -> str:
@@ -1110,12 +1247,18 @@ def run_analysis(
     heat_percentile: float,
     prior_seg_file: Optional[gr.File] = None,
     demo_prior: str = "Off",
-) -> tuple[go.Figure, go.Figure, str, str, str, Optional[str], list[str] | None]:
+    planning_vascular_file: Optional[gr.File] = None,
+    planning_dwi_file: Optional[gr.File] = None,
+    planning_bval_file: Optional[gr.File] = None,
+    planning_bvec_file: Optional[gr.File] = None,
+    planning_same_patient_confirmed: bool = False,
+) -> tuple[go.Figure, go.Figure, str, str, str, Optional[str], list[str] | None,
+           go.Figure, str]:
     """Run the full analysis pipeline and return visual + text outputs.
 
     Returns:
         (plot_3d, plot_mpr, metrics_md, status_md, error_md, report_html,
-        downloads)
+        downloads, surgical_plot, surgical_summary)
     """
     try:
         # --- Build input source (BOTH DICOM + NIfTI compatible) ---
@@ -1148,14 +1291,26 @@ def run_analysis(
                     raise ValueError(
                         f"DICOM anonymization failed: {exc}") from exc
 
-        plot_3d, plot_mpr, metrics_md, warn_md, report, downloads = \
+        (plot_3d, plot_mpr, metrics_md, warn_md, report, downloads,
+         surgical_plot, surgical_summary) = \
             _run_pipeline(input_source, axial_idx, sagittal_idx, coronal_idx,
                           bg_modality.lower(), overlay_opacity,
                           [int(c) for c in show_classes], cleanup_min_vox,
                           prior_path=(prior_seg_file.name
                                       if prior_seg_file is not None else None),
-                          demo_prior=demo_prior)
-        return plot_3d, plot_mpr, metrics_md, warn_md, "", report, downloads
+                          demo_prior=demo_prior,
+                          planning_vascular_path=(
+                              planning_vascular_file.name
+                              if planning_vascular_file is not None else None),
+                          planning_dwi_path=(planning_dwi_file.name
+                                             if planning_dwi_file is not None else None),
+                          planning_bval_path=(planning_bval_file.name
+                                              if planning_bval_file is not None else None),
+                          planning_bvec_path=(planning_bvec_file.name
+                                              if planning_bvec_file is not None else None),
+                          planning_same_patient_confirmed=planning_same_patient_confirmed)
+        return (plot_3d, plot_mpr, metrics_md, warn_md, "", report, downloads,
+                surgical_plot, surgical_summary)
 
     except IngestionError as exc:
         # Partial-DICOM fallback: instead of blank viewers, render the
@@ -1262,7 +1417,8 @@ def run_analysis(
                 error_md = (f"### Ingestion note\n\n{exc}\n\n"
                             "Showing partial-data analysis above "
                             "(anatomy + asymmetry heat + geometric estimate).")
-                return plot_3d, plot_mpr, metrics_md, warn_md, error_md, None, None
+                return (plot_3d, plot_mpr, metrics_md, warn_md, error_md, None,
+                        None, gr.skip(), gr.skip())
         error_md = f"### Ingestion note\n\n{exc}"
     except FileNotFoundError as exc:
         error_md = f"### Model / file note\n\n{exc}"
@@ -1272,7 +1428,7 @@ def run_analysis(
     # Keep the last successful study visible. A validation error should guide
     # the next action, not erase a result that a user may still be reviewing.
     return (gr.skip(), gr.skip(), gr.skip(), "", error_md,
-            gr.skip(), gr.skip())
+            gr.skip(), gr.skip(), gr.skip(), gr.skip())
 
 
 def run_local_brats_demo(
@@ -1283,7 +1439,8 @@ def run_local_brats_demo(
     overlay_opacity: float = 0.8,
     show_classes: Optional[list[int]] = None,
     cleanup_min_vox: int = 50,
-) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None]:
+) -> tuple[go.Figure, go.Figure, str, str, Optional[str], list[str] | None,
+           go.Figure, str]:
     """Run the bundled four-modal BraTS study without a manual upload.
 
     This is a convenience path for the presentation demo. It uses exactly the
@@ -1321,9 +1478,10 @@ def _message_update(value: str):
 def _analysis_outputs_for_ui(result):
     """Map pipeline output into visible-on-demand status and error messages."""
     (plot_3d, plot_mpr, metrics_md, status_md, error_md,
-     report, downloads) = result
+     report, downloads, surgical_plot, surgical_summary) = result
     return (plot_3d, plot_mpr, metrics_md, _message_update(status_md),
-            _message_update(error_md), report, downloads)
+            _message_update(error_md), report, downloads, surgical_plot,
+            surgical_summary)
 
 
 def run_analysis_ui(*args):
@@ -1334,10 +1492,12 @@ def run_analysis_ui(*args):
 def run_local_brats_demo_ui(*args):
     """Adapt the local demo for the UI's separate status and error strips."""
     try:
-        plot_3d, plot_mpr, metrics_md, status_md, report, downloads = \
+        (plot_3d, plot_mpr, metrics_md, status_md, report, downloads,
+         surgical_plot, surgical_summary) = \
             run_local_brats_demo(*args)
         return _analysis_outputs_for_ui(
-            (plot_3d, plot_mpr, metrics_md, status_md, "", report, downloads)
+            (plot_3d, plot_mpr, metrics_md, status_md, "", report, downloads,
+             surgical_plot, surgical_summary)
         )
     except Exception as exc:  # noqa: BLE001 - keep the UI actionable
         empty_fig = go.Figure()
@@ -1347,7 +1507,8 @@ def run_local_brats_demo_ui(*args):
         )
         return _analysis_outputs_for_ui(
             (empty_fig, empty_fig, "", "",
-             f"### Local demo note\n\n{exc}", None, None)
+             f"### Local demo note\n\n{exc}", None, None,
+             empty_fig, "")
         )
 
 
@@ -1479,6 +1640,37 @@ footer { display: none !important; }
   color: var(--ntt-ink) !important;
 }
 .ntt-file svg { color: var(--ntt-accent) !important; stroke: currentColor !important; }
+/* Uploaded-file rows are rendered by Gradio as dark ``tr`` elements when the
+   operating system prefers dark mode.  The surrounding app is light-only, so
+   set both the row surface and every text/link child explicitly. */
+.ntt-file .file-preview table, .ntt-file .file-preview tbody,
+.ntt-file .file-preview tr, .ntt-file .file-preview td,
+.ntt-file .file-preview .file, .ntt-file .file-preview .filename,
+.ntt-file .file-preview .download, .ntt-file .file-preview a {
+  background: #FFFFFF !important;
+  color: var(--ntt-ink) !important;
+}
+.ntt-file .file-preview a:hover { color: var(--ntt-accent-ink) !important; }
+
+/* Checkbox components received a dark block fill from Gradio's system-theme
+   fallback.  Keep acknowledgement and PHI controls readable on the light UI. */
+#input .block:has(> label.checkbox-container),
+#input .checkbox-container {
+  background: #FFFFFF !important;
+  color: var(--ntt-ink) !important;
+  border: 1px solid var(--ntt-border) !important;
+  border-radius: 10px !important;
+}
+#input .block:has(> label.checkbox-container) { padding: 10px 12px !important; }
+#input .checkbox-container, #input .checkbox-container .label-text {
+  color: var(--ntt-ink) !important;
+  opacity: 1 !important;
+}
+#input input[type="checkbox"] {
+  accent-color: var(--ntt-accent) !important;
+  background: #FFFFFF !important;
+  border-color: var(--ntt-ink-3) !important;
+}
 
 /* ---- hero ---- */
 .ntt-hero { position: relative; overflow: hidden; padding: 54px 24px 40px; }
@@ -1560,6 +1752,9 @@ footer { display: none !important; }
 /* ---- accordions ---- */
 .ntt-acc { border: 1px solid var(--ntt-border) !important; border-radius: var(--ntt-radius-sm) !important;
   background: var(--ntt-surface-soft) !important; }
+.ntt-acc .label-wrap, .ntt-acc .label-wrap *, .ntt-acc button {
+  color: var(--ntt-ink) !important; opacity: 1 !important;
+}
 
 /* ---- results panel ---- */
 .ntt-results .gr-markdown, #ntt-metrics, #ntt-metrics * { color: var(--ntt-ink-2) !important; }
@@ -1568,6 +1763,13 @@ footer { display: none !important; }
   border-bottom: 1px solid var(--ntt-border); font-size: 13.5px; background: #FFFFFF; }
 #ntt-metrics th { color: var(--ntt-ink) !important; font-weight: 700; background: #F1F5F9; }
 .ntt-results .gr-plot, .ntt-results .gr-plot > div { border-radius: var(--ntt-radius-sm); overflow: hidden; }
+/* The export accordion sits outside the surgical dark workspace. */
+.ntt-results > .gr-accordion, .ntt-results > .gr-accordion .label-wrap,
+.ntt-results > .gr-accordion .label-wrap * {
+  background: var(--ntt-surface-soft) !important;
+  color: var(--ntt-ink) !important;
+  opacity: 1 !important;
+}
 
 /* ---- run status and error strips ---- */
 .ntt-status { border: 1px solid #93C5FD; background: #EFF6FF; color: #163A63;
@@ -1584,11 +1786,150 @@ footer { display: none !important; }
 /* ---- tabs ---- */
 .ntt-results .gr-tabs button, .ntt-results .tab-nav button { font-weight: 600; }
 
+/* ---- surgeon planning workspace: deliberately distinct, safety-first UI ---- */
+.ntt-surgical { padding: 8px 2px 2px; color: #E5EEF9; }
+.ntt-surgical-head { padding: 22px 24px; border-radius: 14px 14px 0 0;
+  background: linear-gradient(115deg, #0B1220, #172554); border: 1px solid #334155;
+  border-bottom: 0; }
+.ntt-surgical-kicker { margin: 0 0 7px; color: #7DD3FC; font-weight: 750;
+  font-size: 11px; letter-spacing: .13em; text-transform: uppercase; }
+.ntt-surgical-head h2 { margin: 0; color: #F8FAFC; font-size: 25px; letter-spacing: -.02em; }
+.ntt-surgical-head p { margin: 8px 0 0; color: #CBD5E1; max-width: 700px; line-height: 1.45; }
+.ntt-surgical-body { padding: 18px; border: 1px solid #334155; border-radius: 0 0 14px 14px;
+  background: #0F172A; }
+.ntt-surgical .gr-markdown, .ntt-surgical .gr-markdown * { color: #E2E8F0 !important; }
+.ntt-surgical .gr-markdown table { width: 100%; border-collapse: collapse; }
+.ntt-surgical .gr-markdown th { background: #1E293B; color: #F8FAFC !important; }
+.ntt-surgical .gr-markdown td, .ntt-surgical .gr-markdown th { padding: 9px; border: 1px solid #475569; }
+.ntt-surgical .gr-plot, .ntt-surgical .gr-plot > div { border-radius: 10px; overflow: hidden; border: 1px solid #334155; }
+.ntt-surgical-note { margin-top: 14px; padding: 12px 14px; border-left: 3px solid #F59E0B;
+  background: #1C1917; color: #FDE68A; border-radius: 7px; font-size: 13px; line-height: 1.45; }
+
 @media (max-width: 760px) {
   .ntt-hero { padding: 36px 16px 28px; }
   .ntt-workspace-head { margin: 18px 16px 20px; padding: 20px; }
   .ntt-flow { grid-template-columns: 1fr; }
   .ntt-side, .ntt-results { padding: 16px; }
+}
+
+/* ==========================================================================
+   FINAL SYSTEM-THEME GUARD
+   Gradio appends dark-preference rules after its theme variables in some
+   browsers. These selectors deliberately include ``html.dark`` and target
+   the generated table/block nodes, so a dark OS preference cannot produce
+   dark text on dark control surfaces inside this light-only application.
+   ========================================================================== */
+html, body, .gradio-container { color-scheme: light !important; }
+html.dark .gradio-container .ntt-file table.file-preview,
+html.dark .gradio-container .ntt-file table.file-preview tbody,
+html.dark .gradio-container .ntt-file table.file-preview tr.file,
+html.dark .gradio-container .ntt-file table.file-preview tr.file td,
+html.dark .gradio-container .ntt-file table.file-preview tr.file span,
+html.dark .gradio-container .ntt-file table.file-preview tr.file a {
+  background-color: #FFFFFF !important;
+  color: #102A43 !important;
+}
+html.dark .gradio-container #input .block:has(.checkbox-container),
+html.dark .gradio-container #input .checkbox-container,
+html.dark .gradio-container #input .checkbox-container .label-text {
+  background-color: #FFFFFF !important;
+  color: #102A43 !important;
+  opacity: 1 !important;
+}
+html.dark .gradio-container #input .block:has(.checkbox-container) {
+  border-color: #BCCCDC !important;
+}
+html.dark .gradio-container #output > .block.gr-accordion,
+html.dark .gradio-container #output > .block.gr-accordion button,
+html.dark .gradio-container #output > .block.gr-accordion button * {
+  background-color: #F8FAFC !important;
+  color: #102A43 !important;
+  opacity: 1 !important;
+}
+
+/* ==========================================================================
+   2026 PRODUCT REDESIGN — quiet, editorial, Apple-inspired clinical UI
+   ========================================================================== */
+:root {
+  --nv-bg: #f5f5f7;
+  --nv-card: rgba(255,255,255,.90);
+  --nv-ink: #1d1d1f;
+  --nv-muted: #6e6e73;
+  --nv-line: #d2d2d7;
+  --nv-blue: #0071e3;
+  --nv-blue-hover: #0077ed;
+  --nv-soft-blue: #eaf3ff;
+  --nv-radius: 22px;
+}
+html, body, .gradio-container { background: var(--nv-bg) !important; color: var(--nv-ink) !important; }
+.gradio-container { max-width: 1320px !important; padding: 0 24px 48px !important; }
+
+/* A compact editorial masthead replaces the previous dashboard hero. */
+.ntt-workspace-head {
+  margin: 0 -24px 28px !important; padding: 28px 32px 24px !important;
+  border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+  background: rgba(255,255,255,.82) !important; backdrop-filter: blur(16px);
+}
+.ntt-workspace-head::after { display: none !important; }
+.ntt-workspace-kicker { color: var(--nv-blue) !important; font-size: 11px !important; letter-spacing: .1em !important; }
+.ntt-workspace-title { max-width: 760px; font-size: clamp(30px,4vw,48px) !important; letter-spacing: -.045em !important; color: var(--nv-ink) !important; }
+.ntt-workspace-copy { max-width: 610px; margin: 8px 0 18px !important; color: var(--nv-muted) !important; font-size: 15px !important; }
+.ntt-flow { gap: 0 !important; max-width: 700px; }
+.ntt-flow-step { position: relative; padding: 8px 16px 8px 0 !important; border: 0 !important; background: transparent !important; box-shadow: none !important; }
+.ntt-flow-step + .ntt-flow-step { padding-left: 16px !important; border-left: 1px solid var(--nv-line) !important; }
+.ntt-flow-num { color: var(--nv-blue) !important; font-size: 10px !important; }
+.ntt-flow-label { color: var(--nv-ink) !important; }
+.ntt-flow-detail { color: var(--nv-muted) !important; }
+
+/* App shell: compact source rail, generous canvas. */
+#input { gap: 18px !important; align-items: flex-start !important; }
+.ntt-side, .ntt-results {
+  background: var(--nv-card) !important; border: 1px solid rgba(210,210,215,.8) !important;
+  border-radius: var(--nv-radius) !important; box-shadow: 0 10px 32px rgba(0,0,0,.045) !important;
+}
+.ntt-side { position: sticky !important; top: 16px !important; padding: 20px !important; }
+.ntt-results { padding: 26px !important; min-height: 620px; }
+.ntt-section { color: var(--nv-muted) !important; font-size: 10px !important; letter-spacing: .12em !important; }
+.ntt-ready { margin-bottom: 14px !important; background: #f3fbf8 !important; border-color: #b8e8d7 !important; color: #275d50 !important; border-radius: 14px !important; }
+.ntt-ready b { color: var(--nv-ink) !important; }
+
+/* Source controls become simple stacked cards. */
+#ntt-mode { padding: 4px !important; background: #ededf0 !important; border: 0 !important; border-radius: 12px !important; }
+#ntt-mode label { padding: 7px 10px !important; border-radius: 9px !important; }
+.ntt-uploads { padding: 12px !important; background: #fafafa !important; border: 1px solid var(--nv-line) !important; border-style: solid !important; }
+.ntt-file { margin-bottom: 8px !important; }
+.ntt-file, .ntt-file > *, .ntt-file .wrap { border-radius: 12px !important; }
+.ntt-file .file-preview tr.file, .ntt-file .file-preview tr.file td { background: #fff !important; }
+.ntt-file .file-preview .filename, .ntt-file .file-preview .download a { color: var(--nv-ink) !important; }
+.ntt-acc { margin: 10px 0 !important; border-color: var(--nv-line) !important; background: #fafafa !important; border-radius: 14px !important; }
+.ntt-acc > button, .ntt-acc .label-wrap { min-height: 40px !important; color: var(--nv-ink) !important; }
+.ntt-planning-upload { background: var(--nv-soft-blue) !important; border-color: #bad7f5 !important; }
+.ntt-hint, .ntt-step { color: var(--nv-muted) !important; }
+#input .block:has(> label.checkbox-container), #input .checkbox-container { background: transparent !important; border: 0 !important; padding: 3px 0 !important; }
+#input .checkbox-container .label-text { color: var(--nv-ink) !important; font-size: 12px !important; }
+
+/* Clear action hierarchy. */
+#ntt-run { min-height: 46px !important; background: var(--nv-blue) !important; border-radius: 999px !important; box-shadow: none !important; }
+#ntt-run:hover { background: var(--nv-blue-hover) !important; }
+#ntt-demo { min-height: 42px !important; background: transparent !important; border-color: var(--nv-line) !important; border-radius: 999px !important; }
+
+/* Results feel like a calm review surface. */
+#ntt-metrics { padding: 4px 0 18px !important; }
+.ntt-results .gr-tabs { border-bottom: 1px solid var(--nv-line) !important; }
+.ntt-results .gr-tabs button, .ntt-results .tab-nav button { color: var(--nv-muted) !important; }
+.ntt-results .gr-tabs button.selected, .ntt-results .tab-nav button.selected { color: var(--nv-blue) !important; }
+.ntt-results > .gr-accordion, .ntt-results > .gr-accordion button { border-radius: 14px !important; background: #fafafa !important; }
+
+/* Surgical review is intentionally different, but restrained rather than neon. */
+.ntt-surgical { padding: 0 !important; }
+.ntt-surgical-head { padding: 26px !important; background: #1d1d1f !important; border: 0 !important; border-radius: 18px 18px 0 0 !important; }
+.ntt-surgical-head h2 { font-size: 30px !important; }
+.ntt-surgical-body { padding: 22px !important; background: #27272a !important; border: 0 !important; border-radius: 0 0 18px 18px !important; }
+.ntt-surgical-note { background: #3a3020 !important; border-left-color: #f6b73c !important; color: #fff1c2 !important; }
+
+@media (max-width: 900px) {
+  .ntt-side { position: static !important; }
+  .ntt-workspace-head { margin-left: -16px !important; margin-right: -16px !important; }
 }
 """
 
@@ -1609,13 +1950,13 @@ def build_app() -> gr.Blocks:
         gr.HTML(
             """
             <section class="ntt-workspace-head">
-              <p class="ntt-workspace-kicker">NeuroVista &middot; MRI review workspace</p>
-              <h1 class="ntt-workspace-title">Segment, inspect, and export in one workspace.</h1>
-              <p class="ntt-workspace-copy">Use all four MRI modalities for model segmentation, then review region volumes, overlays, and a 3D surface before exporting the result.</p>
+              <p class="ntt-workspace-kicker">NeuroVista / clinical review</p>
+              <h1 class="ntt-workspace-title">A focused workspace for tumour review.</h1>
+              <p class="ntt-workspace-copy">Bring in a complete MRI study, review the model output, then export only what the care team needs.</p>
               <div class="ntt-flow" aria-label="Analysis workflow">
-                <div class="ntt-flow-step"><span class="ntt-flow-num">01 · INPUT</span><span class="ntt-flow-label">Choose a study</span><span class="ntt-flow-detail">Four NIfTI scans or one DICOM ZIP.</span></div>
-                <div class="ntt-flow-step"><span class="ntt-flow-num">02 · ANALYSE</span><span class="ntt-flow-label">Run segmentation</span><span class="ntt-flow-detail">Use the local demo when presenting.</span></div>
-                <div class="ntt-flow-step"><span class="ntt-flow-num">03 · REVIEW</span><span class="ntt-flow-label">Inspect and export</span><span class="ntt-flow-detail">Volumetry, MPR, surface, report, meshes.</span></div>
+                <div class="ntt-flow-step"><span class="ntt-flow-num">01</span><span class="ntt-flow-label">Import</span><span class="ntt-flow-detail">Four NIfTI scans or a DICOM ZIP.</span></div>
+                <div class="ntt-flow-step"><span class="ntt-flow-num">02</span><span class="ntt-flow-label">Analyse</span><span class="ntt-flow-detail">Generate the draft segmentation.</span></div>
+                <div class="ntt-flow-step"><span class="ntt-flow-num">03</span><span class="ntt-flow-label">Review</span><span class="ntt-flow-detail">Inspect, verify, export.</span></div>
               </div>
             </section>
             """
@@ -1649,6 +1990,31 @@ def build_app() -> gr.Blocks:
                     gr.Markdown('<p class="ntt-hint"><b>One file</b> &mdash; zip of DICOM series; anonymize PHI on upload.</p>')
                     zip_file = gr.File(label="DICOM ZIP", file_types=[".zip"], elem_classes=["ntt-file"])
                     anonymize = gr.Checkbox(value=True, label="Anonymize on upload (strip PHI, keep geometry)")
+                with gr.Accordion("Add surgical planning data (optional)", open=False,
+                                  elem_classes=["ntt-acc", "ntt-planning-upload"]):
+                    gr.Markdown(
+                        '<p class="ntt-hint">Optional vessel and diffusion images are kept separate from '
+                        'the tumour MRI. They are review candidates only, never an approved navigation plan.</p>'
+                    )
+                    planning_vascular_file = gr.File(
+                        label="TOF-MRA / CTA for vessel review",
+                        file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"],
+                    )
+                    with gr.Accordion("Diffusion MRI for tract planning", open=False,
+                                      elem_classes=["ntt-acc"]):
+                        gr.Markdown(
+                            '<p class="ntt-hint">Upload matching pre-operative DWI with gradients. The app '
+                            'creates a T1-grid baseline for visual QA only; it does not approve navigation.</p>'
+                            '<p class="ntt-hint"><b>Local test DWI:</b> '
+                            '<code>data/openneuro_ds001226_PAT01/dwi</code> (separate patient).</p>'
+                        )
+                        planning_dwi_file = gr.File(label="Diffusion MRI (DWI)", file_types=[".nii", ".nii.gz"], elem_classes=["ntt-file"])
+                        planning_bval_file = gr.File(label="DWI b-values (.bval)", file_types=[".bval", ".txt"], elem_classes=["ntt-file"])
+                        planning_bvec_file = gr.File(label="DWI gradient directions (.bvec)", file_types=[".bvec", ".txt"], elem_classes=["ntt-file"])
+                        planning_same_patient_confirmed = gr.Checkbox(
+                            value=False,
+                            label="DWI is from the same patient and pre-operative session",
+                        )
                 gr.Markdown('<p class="ntt-section">2 &middot; Configure</p>')
                 gr.Markdown('<p class="ntt-step">Upload a complete study, then start analysis. Advanced settings are optional.</p>')
                 run_btn = gr.Button("Run analysis", elem_classes=["ntt-primary"], elem_id="ntt-run")
@@ -1683,6 +2049,28 @@ def build_app() -> gr.Blocks:
                         plot_3d = gr.Plot(label="3D tumour surface")
                     with gr.Tab("MPR Viewer"):
                         plot_mpr = gr.Plot(label="Multi-planar reconstruction")
+                    with gr.Tab("Surgical Planning"):
+                        with gr.Column(elem_classes=["ntt-surgical"]):
+                            gr.HTML(
+                                '<section class="ntt-surgical-head">'
+                                '<p class="ntt-surgical-kicker">Pre-operative review workspace</p>'
+                                '<h2>Plan around what matters.</h2>'
+                                '<p>Review the draft tumour map with critical anatomy status before any '
+                                'surgical approach is considered.</p></section>'
+                                '<section class="ntt-surgical-body">'
+                            )
+                            surgical_summary = gr.Markdown(
+                                "## Pre-operative planning gate\n\n"
+                                "Run an analysis to load the draft tumour layer. "
+                                "Patient-specific vessels and white-matter tracts require registered "
+                                "TOF-MRA/CTA and DTI data.",
+                            )
+                            surgical_plot = gr.Plot(label="Draft pre-operative 3D overview")
+                            gr.HTML(
+                                '<p class="ntt-surgical-note"><b>Safety gate:</b> this workspace does not '
+                                'generate an operative trajectory unless critical anatomy has been supplied '
+                                'and reviewed by the surgeon.</p></section>'
+                            )
                 with gr.Accordion("Exports", open=False):
                     report_html = gr.File(label="Report (HTML)")
                     downloads = gr.Files(label="Meshes and segmentation")
@@ -1705,10 +2093,12 @@ def build_app() -> gr.Blocks:
                 axial_slider, sagittal_slider, coronal_slider,
                 bg_modality, overlay_opacity, show_classes, cleanup_min_vox,
                 anonymize, show_heat, heat_percentile,
-                prior_seg_file, demo_prior,
+                prior_seg_file, demo_prior, planning_vascular_file,
+                planning_dwi_file, planning_bval_file, planning_bvec_file,
+                planning_same_patient_confirmed,
             ],
             outputs=[plot_3d, plot_mpr, metrics_md, status_md, error_md,
-                     report_html, downloads],
+                     report_html, downloads, surgical_plot, surgical_summary],
         )
         demo_btn.click(
             run_local_brats_demo_ui,
@@ -1717,7 +2107,7 @@ def build_app() -> gr.Blocks:
                 bg_modality, overlay_opacity, show_classes, cleanup_min_vox,
             ],
             outputs=[plot_3d, plot_mpr, metrics_md, status_md, error_md,
-                     report_html, downloads],
+                     report_html, downloads, surgical_plot, surgical_summary],
         )
     return demo
 
@@ -1728,12 +2118,12 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
+    import sys
+    import uvicorn
+    from webapp import create_app
+
     host = os.environ.get("APP_HOST", "127.0.0.1")
     port = int(os.environ.get("APP_PORT", "7860") or 7860)
-    app = build_app()
-    app.launch(
-        theme=_APPLE_THEME,
-        css=_APPLE_CSS,
-        server_name=host,
-        server_port=port,
-    )
+    # The Gradio builder remains available to existing tests and integrations;
+    # the local product now serves the dedicated FastAPI interface instead.
+    uvicorn.run(create_app(sys.modules[__name__]), host=host, port=port)

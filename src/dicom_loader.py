@@ -52,6 +52,8 @@ __all__ = [
     "DICOMCorruptError",
     "SpatialMetadata",
     "PatientScans",
+    "PlanningSeries",
+    "inspect_surgical_planning_series",
     "load_patient_scans",
     "prepare_for_inference",
 ]
@@ -80,6 +82,15 @@ _SCOUT_TOKENS = ("survey", "scout", "localizer", "loc", "topogram",
 
 # DICOM file extensions (case-insensitive).
 _DICOM_EXTS = {".dcm", ".dicom", ".ima"}
+
+# These labels only identify likely planning inputs from DICOM metadata. They
+# do not establish image quality, spatial registration, or clinical validity.
+_PLANNING_SERIES_TOKENS: dict[str, tuple[str, ...]] = {
+    "vascular": ("tof", "mra", "angiography", "angiogram", "cta", "ct angio"),
+    "tractography": ("dti", "diffusion tensor", "tractography"),
+    "functional": ("fmri", "bold", "functional", "language task", "motor task"),
+    "bone": ("ct head", "head ct", "bone", "cranial ct"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +160,22 @@ class PatientScans:
     volumes: dict[str, np.ndarray]
     metadata: dict[str, SpatialMetadata]
     source: str
+
+
+@dataclass(frozen=True)
+class PlanningSeries:
+    """A candidate pre-operative planning series discovered in DICOM metadata.
+
+    Discovery is intentionally metadata-only. A candidate must still be
+    converted, registered to the tumour MRI, and reviewed before it can be
+    shown as a navigable critical-structure layer.
+    """
+
+    role: str
+    series_uid: str
+    description: str
+    protocol: str
+    slice_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +342,55 @@ def _infer_modality_from_dicom(meta: dict[str, object]) -> Optional[str]:
             if tok in haystack:
                 return mod
     return None
+
+
+def _infer_planning_role(meta: dict[str, object]) -> Optional[str]:
+    """Return the strongest surgical-planning role suggested by metadata."""
+    haystack = " ".join(
+        str(meta.get(k) or "") for k in ("series_desc", "protocol", "image_type")
+    ).lower()
+    for role, tokens in _PLANNING_SERIES_TOKENS.items():
+        if any(token in haystack for token in tokens):
+            return role
+    return None
+
+
+def inspect_surgical_planning_series(root: str) -> list[PlanningSeries]:
+    """Discover candidate planning series without loading their pixel data.
+
+    ``root`` may be a DICOM directory or ZIP. Returned entries are *not*
+    registered layers and should be presented as requiring technical and
+    surgical review. Failures are raised as :class:`IngestionError` so callers
+    can retain the tumour workflow while showing a precise planning-data note.
+    """
+    work_dir: Optional[str] = None
+    try:
+        if zipfile.is_zipfile(root):
+            work_dir = _extract_zip(root)
+            search_root = work_dir
+        else:
+            search_root = root
+        files = _discover_dicom_files(search_root)
+        if not files:
+            raise IngestionError(f"No DICOM files found under '{root}'.")
+        candidates: list[PlanningSeries] = []
+        for uid, series_files in _group_dicom_series(files).items():
+            meta = _read_dicom_series_metadata(series_files[0])
+            role = _infer_planning_role(meta)
+            if role is None:
+                continue
+            candidates.append(PlanningSeries(
+                role=role,
+                series_uid=uid,
+                description=str(meta.get("series_desc") or "Unnamed series"),
+                protocol=str(meta.get("protocol") or ""),
+                slice_count=len(series_files),
+            ))
+        return sorted(candidates, key=lambda item: (item.role, item.description))
+    finally:
+        if work_dir is not None:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _sort_series_by_position(files: Sequence[str]) -> list[str]:
@@ -536,6 +612,7 @@ def _load_dicom_root(root: str) -> PatientScans:
         # multi-orientation localizers and never stackable.
         series_modality: dict[str, str] = {}
         skipped_scouts: list[str] = []
+        skipped_planning: list[str] = []
         for uid, series_files in groups.items():
             meta = _read_dicom_series_metadata(series_files[0])
             mod = _infer_modality_from_dicom(meta)
@@ -544,6 +621,12 @@ def _load_dicom_root(root: str) -> PatientScans:
                     f"{meta.get('series_desc')!r} ({len(series_files)} slices)")
                 continue
             if mod is None:
+                planning_role = _infer_planning_role(meta)
+                if planning_role is not None:
+                    skipped_planning.append(
+                        f"{planning_role}: {meta.get('series_desc')!r} "
+                        f"({len(series_files)} slices)")
+                    continue
                 raise IngestionError(
                     f"Cannot infer modality for DICOM series '{uid}' "
                     f"(description: {meta.get('series_desc')!r}). "
@@ -561,10 +644,13 @@ def _load_dicom_root(root: str) -> PatientScans:
         if missing:
             scout_note = (f" Skipped scout/localizer series: "
                           f"{'; '.join(skipped_scouts)}." if skipped_scouts else "")
+            planning_note = (f" Detected planning candidate series: "
+                             f"{'; '.join(skipped_planning)}."
+                             if skipped_planning else "")
             raise MissingModalityError(
                 f"Missing DICOM series for modality/modalities: {missing}. "
                 f"Found series: {sorted(series_modality.keys())}."
-                + scout_note
+                + scout_note + planning_note
             )
 
         # Convert each series and validate.

@@ -20,6 +20,7 @@ from src.dicom_loader import (
     MissingModalityError,
     OrientationMismatchError,
     ShapeMismatchError,
+    inspect_surgical_planning_series,
     load_patient_scans,
     prepare_for_inference,
 )
@@ -131,6 +132,30 @@ def _create_synthetic_dicom_patient(
         uid = _create_synthetic_dicom_series(series_dir, mod, n_slices=n_slices)
         uids[mod] = uid
     return root, uids
+
+
+def test_inspect_surgical_planning_series_detects_candidates() -> None:
+    """Planning-series discovery must not confuse candidates with layers."""
+    import pydicom
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root, _ = _create_synthetic_dicom_patient(tmpdir)
+        planning_dir = os.path.join(root, "planning_mra")
+        _create_synthetic_dicom_series(planning_dir, "t2")
+        for name in os.listdir(planning_dir):
+            path = os.path.join(planning_dir, name)
+            ds = pydicom.dcmread(path, force=True)
+            ds.SeriesDescription = "3D TOF MRA"
+            ds.ProtocolName = "TOF angiography"
+            ds.save_as(path)
+
+        candidates = inspect_surgical_planning_series(root)
+        scans = load_patient_scans(root)
+
+    assert len(candidates) == 1
+    assert candidates[0].role == "vascular"
+    assert candidates[0].description == "3D TOF MRA"
+    assert set(scans.volumes) == set(MODALITIES)
 
 
 def _create_synthetic_patient(tmpdir: str, shape: tuple[int, int, int] = (64, 64, 64)) -> dict[str, str]:
@@ -264,7 +289,6 @@ def test_dicom_missing_series() -> None:
 
 def test_synth_dicom_patient_roundtrip() -> None:
     """End-to-end over the Track-A synthetic DICOM patient (if present)."""
-    import shutil
     from src.io_unified import load_unified
     from src.dicom_loader import prepare_for_inference
 
