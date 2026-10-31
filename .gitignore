@@ -19,7 +19,7 @@ env/
 *.nbconvert.ipynb
 
 # Data / artifacts
-data/
+#data/
 artifacts/
 checkpoints/
 outputs/
